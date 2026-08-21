@@ -425,6 +425,198 @@ describe("Drive parent folder probe", () => {
   });
 });
 
+describe("Drive creation parent authorization", () => {
+  it("resolves the account root alias to its canonical ID before authorizing it", async () => {
+    let events: string[] = [];
+    let { session, getFile } = core({
+      getFile: async id => {
+        events.push(`fetch:${id}`);
+        return file({
+          id: "root-id", name: "My Drive", mimeType: FOLDER_MIME_TYPE,
+          capabilities: { canAddChildren: true },
+        });
+      },
+      prepareObservation: async ids => {
+        events.push(`prepare:${ids.join(",")}`);
+        return { pendingSets: ids, commit: () => events.push("commit") };
+      },
+      authorize: async () => { events.push("authorize"); },
+    });
+
+    await expect(session.resolveCreationParent()).resolves.toEqual({
+      id: "root-id", name: "My Drive",
+    });
+    expect(getFile).toHaveBeenCalledWith("root");
+    expect(events).toEqual(["fetch:root", "prepare:root-id", "authorize", "commit"]);
+  });
+
+  it("uses and fetches the bound shared-drive root by default", async () => {
+    let { session, getFile, prepared } = core({
+      scope: { kind: "sharedDrive", driveId: "drive-1" },
+      getFile: async id => file({
+        id, name: "Team Drive", mimeType: FOLDER_MIME_TYPE,
+        capabilities: { canAddChildren: true },
+      }),
+    });
+
+    await expect(session.resolveCreationParent()).resolves.toEqual({
+      id: "drive-1", name: "Team Drive",
+    });
+    expect(getFile).toHaveBeenCalledWith("drive-1");
+    expect(prepared).toEqual([["drive-1"]]);
+  });
+
+  it("fetches an explicit nested folder ID exactly", async () => {
+    let { session, getFile } = core({
+      getFile: async id => file({
+        id, name: "Nested", mimeType: FOLDER_MIME_TYPE,
+        capabilities: { canAddChildren: true },
+      }),
+    });
+
+    await expect(session.resolveCreationParent(" folder-with-spaces "))
+      .resolves.toEqual({ id: " folder-with-spaces ", name: "Nested" });
+    expect(getFile).toHaveBeenCalledWith(" folder-with-spaces ");
+  });
+
+  it("rejects an empty explicit parent ID before provider access", async () => {
+    let { session, getFile } = core();
+    await expect(session.resolveCreationParent("   "))
+      .rejects.toThrow("parentId must not be empty");
+    expect(getFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects exact-file creation authority before provider access", async () => {
+    let { session, getFile } = core({ scope: { kind: "file", fileId: "folder-1" } });
+    await expect(session.resolveCreationParent("folder-1"))
+      .rejects.toThrow(/outside this Drive binding/);
+    expect(getFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["ordinary file", "application/pdf"],
+    ["shortcut", "application/vnd.google-apps.shortcut"],
+  ])("rejects a %s as a creation destination", async (_kind, mimeType) => {
+    let { session, prepared, authorizations, events } = core({
+      getFile: async id => file({
+        id, mimeType, capabilities: { canAddChildren: true },
+      }),
+    });
+
+    await expect(session.resolveCreationParent("file-1"))
+      .rejects.toThrow("Drive creation parent must identify a folder");
+    expect(prepared).toEqual([["file-1"]]);
+    expect(authorizations).toEqual([expect.objectContaining({
+      title: "Check Google Drive creation destination",
+    })]);
+    expect(events).toEqual(["authorize", "commit"]);
+  });
+
+  it.each([undefined, false])(
+    "rejects a folder whose canAddChildren capability is %s",
+    async canAddChildren => {
+      let { session, prepared, authorizations, events } = core({
+        getFile: async id => file({
+          id, mimeType: FOLDER_MIME_TYPE,
+          capabilities: canAddChildren === undefined ? {} : { canAddChildren },
+        }),
+      });
+
+      await expect(session.resolveCreationParent("folder-1"))
+        .rejects.toThrow("Drive creation parent does not allow adding children");
+      expect(prepared).toEqual([["folder-1"]]);
+      expect(authorizations).toEqual([expect.objectContaining({
+        title: "Check Google Drive creation destination",
+      })]);
+      expect(events).toEqual(["authorize", "commit"]);
+    },
+  );
+
+  it("rejects a folder from another shared drive before observation", async () => {
+    let { session, prepared } = core({
+      scope: { kind: "sharedDrive", driveId: "drive-1" },
+      getFile: async id => file({
+        id, driveId: "drive-2", mimeType: FOLDER_MIME_TYPE,
+        capabilities: { canAddChildren: true },
+      }),
+    });
+
+    await expect(session.resolveCreationParent("folder-1"))
+      .rejects.toThrow(/outside this Drive binding/);
+    expect(prepared).toEqual([]);
+  });
+
+  it("fails revalidation when an approved parent moves outside the binding", async () => {
+    let request = 0;
+    let { session } = core({
+      scope: { kind: "sharedDrive", driveId: "drive-1" },
+      getFile: async id => file({
+        id, driveId: request++ === 0 ? "drive-1" : "drive-2",
+        mimeType: FOLDER_MIME_TYPE, capabilities: { canAddChildren: true },
+      }),
+    });
+
+    await expect(session.resolveCreationParent("folder-1"))
+      .resolves.toEqual({ id: "folder-1", name: "Quarterly plan" });
+    await expect(session.revalidateCreationParent("folder-1"))
+      .rejects.toThrow(/outside this Drive binding/);
+  });
+
+  it.each([403, 404])(
+    "normalizes a %s shared-drive creation-parent probe without observation",
+    async status => {
+      let { session, prepared, authorizations } = core({
+        scope: { kind: "sharedDrive", driveId: "drive-1" },
+        getFile: async () => { throw new DriveApiRequestError(status); },
+      });
+
+      await expect(session.resolveCreationParent("foreign"))
+        .rejects.toThrow(new Error("The requested file is outside this Drive binding."));
+      expect(prepared).toEqual([]);
+      expect(authorizations).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["explicit account parent", { kind: "account" } as const, "folder-1", "folder-2"],
+    ["default shared-drive root", { kind: "sharedDrive", driveId: "drive-1" } as const,
+      undefined, "drive-2"],
+  ])("rejects a substituted response ID for an %s before observation",
+    async (_name, scope, requestedId, returnedId) => {
+      let { session, prepared, authorizations } = core({
+        scope,
+        getFile: async () => file({
+          id: returnedId, driveId: scope.kind === "sharedDrive" ? scope.driveId : undefined,
+          mimeType: FOLDER_MIME_TYPE, trashed: false,
+          appProperties: { gadgetsCreationRequestId: "123e4567-e89b-42d3-a456-426614174000" },
+          capabilities: { canAddChildren: true },
+        }),
+      });
+
+      await expect(session.resolveCreationParent(requestedId))
+        .rejects.toThrow(new Error("The requested file is outside this Drive binding."));
+      expect(prepared).toEqual([]);
+      expect(authorizations).toEqual([]);
+    });
+  it("does not reveal parent properties or commit observation when authorization fails", async () => {
+    let prepared: string[][] = [];
+    let committed = false;
+    let { session } = core({
+      getFile: async id => file({ id, mimeType: "application/pdf" }),
+      prepareObservation: async ids => {
+        prepared.push(ids);
+        return { pendingSets: ids, commit: () => { committed = true; } };
+      },
+      authorize: async () => { throw new Error("denied"); },
+    });
+
+    await expect(session.resolveCreationParent("folder-1"))
+      .rejects.toThrow("denied");
+    expect(prepared).toEqual([["folder-1"]]);
+    expect(committed).toBe(false);
+  });
+});
+
 describe("Drive native sessions", () => {
   const docMime = "application/vnd.google-apps.document";
   const sheetMime = "application/vnd.google-apps.spreadsheet";

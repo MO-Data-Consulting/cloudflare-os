@@ -44,9 +44,9 @@ export type FetchWithAuthRetryOptions = {
   /** Per-attempt abort timeout in milliseconds. Omitted means no timeout is imposed. */
   timeoutMs?: number;
   /**
-   * Asserts this request is safe to replay on 429 / 5xx / timeout. Must only be set for a request
-   * that performs no writes. Non-GET methods default to unsafe; this is the opt-in for a POST that
-   * is still just a read (Drive's batch `files.get` envelope).
+   * Asserts this request is safe to replay on 429 / 5xx / timeout without duplicating its effects.
+   * Non-GET methods default to unsafe; opt in only for idempotent writes or read-only requests such
+   * as Drive's batch `files.get` envelope.
    */
   idempotent?: boolean;
 };
