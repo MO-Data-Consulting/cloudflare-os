@@ -66,7 +66,7 @@ export const BIGQUERY_RESOURCE: SupportedResource = {
 };
 
 /**
- * Metadata for every file and folder the connected Google Drive account can read.
+ * Files, folders, and read-only native Google Docs and Sheets available to the connected account.
  *
  * Whole-account, not just My Drive: listings set `includeItemsFromAllDrives`, so a shared drive the
  * account belongs to is inside this grant.
@@ -76,24 +76,24 @@ export const GOOGLE_DRIVE_RESOURCE: SupportedResource = {
   title: "Google Drive Account",
   description:
       "Find files and folders anywhere this Google account can read in Drive, including shared " +
-      "drives. Full-text search examines indexed file content, descriptions, and OCR text; " +
-      "results contain metadata only.",
+      "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
+      "results contain metadata only, while native Google Docs and Sheets can be opened read-only.",
   grantable: true,
 };
 
-/** Metadata across one Google Workspace shared drive, keyed by its immutable drive ID. */
+/** Files, folders, and read-only native content in one Google Workspace shared drive. */
 export const GOOGLE_SHARED_DRIVE_RESOURCE: SupportedResource = {
   urlPattern: "https://drive.google.com/drive/folders/:driveId",
   title: "Google Workspace Shared Drive",
-  description: "Find files and folders in one organization-owned shared drive.",
+  description: "Find files and folders, and read native Google Docs and Sheets, in one organization-owned shared drive.",
   grantable: true,
 };
 
-/** Metadata for one immutable Drive file ID. */
+/** Metadata and, when native, read-only content for one immutable Drive file ID. */
 export const GOOGLE_DRIVE_FILE_RESOURCE: SupportedResource = {
   urlPattern: "https://drive.google.com/file/d/:fileId/view",
   title: "Google Drive File",
-  description: "Read metadata for one Drive file.",
+  description: "Read metadata and, for a native Google Doc or Sheet, content from one Drive file.",
   grantable: true,
 };
 
@@ -163,7 +163,11 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
   },
   {
     resource: GOOGLE_DRIVE_RESOURCE,
-    scopes: ["https://www.googleapis.com/auth/drive.metadata.readonly"],
+    scopes: [
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+      "https://www.googleapis.com/auth/documents.readonly",
+      "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ],
   },
   {
     resource: GOOGLE_SHARED_DRIVE_RESOURCE,
@@ -178,7 +182,11 @@ export const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] 
   },
   {
     resource: GOOGLE_DRIVE_FILE_RESOURCE,
-    scopes: ["https://www.googleapis.com/auth/drive.metadata.readonly"],
+    scopes: [
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+      "https://www.googleapis.com/auth/documents.readonly",
+      "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ],
   },
   {
     resource: BIGQUERY_RESOURCE,
