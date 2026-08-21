@@ -56,12 +56,23 @@ describe("embedded agent declarations", () => {
 
   it("compiles the exact Google Drive agent declaration bundle without module dependencies", () => {
     const types = [
+      "declare class RpcTarget {}",
       source("docs-read-types.txt"),
       source("sheets-types.txt"),
       stripTypeModulePrefix(source("drive-types.txt"), DRIVE_TYPES_MODULE_PREFIX),
     ].join("\n");
 
     expect(compileAgentTypes(types)).toEqual([]);
+  });
+
+  it("keeps the Drive declaration aligned after module-only imports", () => {
+    const modulePrefix =
+      'import type { RpcTarget } from "cloudflare:workers";\n' +
+      'import type { GoogleDocReadSession } from "./docs-read-types";\n' +
+      'import type { GoogleSpreadsheetSession } from "./sheets-types";\n\n';
+    const driveTypes = source("drive-types.d.ts");
+    expect(driveTypes.startsWith(modulePrefix)).toBe(true);
+    expect(source("drive-types.txt")).toBe(driveTypes);
   });
 
   it("keeps Drive Docs authority read-only", () => {
@@ -83,5 +94,45 @@ describe("embedded agent declarations", () => {
       "openGoogleSheet(fileId: string): Promise<GoogleSpreadsheetSession>",
     );
     expect(driveTypes).not.toContain("GoogleDocSession>");
+  });
+
+  it("splits Drive creation authority from read-only sessions", () => {
+    const types = [
+      "declare class RpcTarget {}",
+      source("docs-read-types.txt"),
+      stripTypeModulePrefix(source("docs-types.txt"), DOCS_TYPES_MODULE_PREFIX),
+      source("sheets-types.txt"),
+      stripTypeModulePrefix(source("drive-types.txt"), DRIVE_TYPES_MODULE_PREFIX),
+      `
+        declare const account: GoogleDriveSession;
+        declare const sharedDrive: GoogleDriveSession;
+        declare const file: GoogleDriveReadSession;
+        declare const nestedDoc: GoogleDocReadSession;
+        declare const directDoc: GoogleDocSession;
+        declare const sheet: GoogleSpreadsheetSession;
+
+        account.createGoogleDoc({ name: "Quarterly plan" });
+        account.createGoogleSheet({ name: "Forecast", parentId: "folder-1" });
+        account.createFolder({ name: "Archive" });
+        account.getCreationResult({ id: 1, kind: "googleDoc", name: "Quarterly plan" });
+        sharedDrive.createGoogleDoc({ name: "Quarterly plan" });
+        sharedDrive.createGoogleSheet({ name: "Forecast" });
+        sharedDrive.createFolder({ name: "Archive", parentId: "folder-2" });
+        sharedDrive.getCreationResult({ id: 2, kind: "folder", name: "Archive" });
+
+        // @ts-expect-error Exact-file Drive sessions remain read-only.
+        file.createGoogleDoc({ name: "Denied" });
+        // @ts-expect-error Exact-file Drive sessions cannot query creation actions.
+        file.getCreationResult({ id: 1, kind: "googleDoc", name: "Denied" });
+        // @ts-expect-error Nested Docs sessions expose no Drive creation methods.
+        nestedDoc.createFolder({ name: "Denied" });
+        // @ts-expect-error Direct Docs bindings retain only their existing document API.
+        directDoc.createGoogleDoc({ name: "Denied" });
+        // @ts-expect-error Nested and direct Sheets sessions expose no Drive creation methods.
+        sheet.createGoogleSheet({ name: "Denied" });
+      `,
+    ].join("\n");
+
+    expect(compileAgentTypes(types)).toEqual([]);
   });
 });
