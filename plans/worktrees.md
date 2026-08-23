@@ -114,6 +114,7 @@ agent-facing `Worktree` binding API).
   Likely API addition while finalizing the shared types: `putMany()` (or explicitly
   blessing pipelined un-awaited `put()`s) — unpacking a packfile is thousands of
   objects and one awaited RPC each is needless.
+XXX The RPC in this case is between a facet and its parent, which is always local. That said, there is also no need for the caller to await each RPC serially -- it's fine to issue many in parallel. So I don't think a `putMany` is needed.
 - **`gitProvenance` collection**, keyed `(oid, gatekeeperId)` where `gatekeeperId` is
   the `GatekeeperRecord`'s `WorkpieceId` (the gatekeeper DO is per-resource, so this
   identifies the repo too). Multiple gatekeepers may claim the same oid. Rows are
@@ -124,6 +125,8 @@ agent-facing `Worktree` binding API).
      re-pullable from it (the "populated in the past, since evicted" case).
   Transitive references (a pulled commit's tree, a tree's subtrees/blobs) gain rows at
   fault time: the pull driver knows the `referencedBy` chain it is walking.
+XXX I would recommend a table mapping oids to arrays of gatekeeper IDs, rather than a separate row for each pair. This is more idiomatic for typed-storage.
+XXX Let's call this `gitObjectMetadata` since there could be other metadata we want to add later (or maybe now -- type and size, perhaps?). Note that the only reason we shouldn't merge this with the `gitObjects` collection is because reading an item from `gitObjects` requires reading the entire object content, which is wasteful if we just want metadata. (Also, in some cases we'll have metadata about an object without actually having the object -- if we learned about it from an observation but haven't pulled it yet.)
 - **Pull driver** `ensureGitObjects(oids, hints)` in the overseer: look up provenance
   (trying each recorded gatekeeper on failure), mint the gatekeeper stub through the
   existing `getGatekeeperClassFor` chokepoint (so disabled gatekeepers/resources stay
@@ -134,6 +137,7 @@ agent-facing `Worktree` binding API).
   worktree-path readers catch isomorphic-git's NotFoundError (it names the missing
   oid), resolve provenance, pull, retry. Gadget-history reads never fault (their
   objects are always local).
+XXX Wouldn't it be better for the FS callback from isomorphic-git to generate the pull itself? We shouldn't be trying to parse error messages coming back from isomorphic-git. Another alternative to consider: Parsing blobs is pretty simple. Maybe we're trying too hard to reuse isomorphic-git here when we could be doing it ourselves? Maybe if we wrote it ourselves it would be easier to handle faulting and track provenance? I'm not sure -- asking you to weigh the pros and cons.
 - **git-store extensions**:
   - Raw object read/write helpers used by the cache impl (inflate/deflate + header
     split), private to git-store + cache.
@@ -160,6 +164,7 @@ agent-facing `Worktree` binding API).
     *chat binding* namespace only (validated against the chat's existing bindings,
     like other chat-local bindings), not in the workspace-wide `byBindingName` index.
   - Deleted when their chat is deleted (extend chat deletion cleanup).
+XXX We should try to match GadgetRecord as much as possible here, so that code handling gadget code vs. worktrees can be the same. In fact, it may be worth considering whether worktrees should actually be stored in the gadgets table, adapting `GadgetRecord` by adding a `type` property. This avoids the need to check both tables to figure out what a WorkpieceId refers to. Essentially, `GadgetRecord` becomes more like a `WorkpieceRecord`, and maybe gatekeepers can eventually be unified into the table as well -- although that would be out-of-scope for this PR.
 - **`createWorktree` agent tool**, mirroring `createGadget`'s shape: validate the
   binding name against the chat scope; resolve the commit id against **known
   provenance** — full oid or unambiguous prefix (prefix scan over `gitProvenance`;
@@ -169,6 +174,7 @@ agent-facing `Worktree` binding API).
   performs the **initial pull**: `gitPull([commit], cache, {type: "commit",
   commitHistory: {kind: "depth", depth: 1}, filterBlobSize: EAGER_BLOB_LIMIT})` —
   one fetch for commit + all trees + small blobs.
+XXX Note that there's no reason to prohibit creating a worktree from a commit that didn't come from a gatekeeper.
 - **Pin at birth**: creation declares the pin `{gadgetId: worktreeId, baseCommit}` on
   the same `"changes"` batch that records the creation (like `createdGadgets`), so
   `buildChatContent` reconstruction works from the log alone.
@@ -181,6 +187,7 @@ agent-facing `Worktree` binding API).
   - **System prompt**: list the worktree binding with metadata (name, source repo,
     head commit, file/dir count) but **never** its file list — repo-scale lists don't
     belong in the prompt. Discovery goes through the binding API (and grep).
+XXX Agreed file list doesn't belong in the prompt, but note that since worktrees are chat-specific, none exist at the start of the chat, and therefore there's nothing to list in the system prompt, so maybe it's a moot point?
   - `getEnvForAgent`/`makeBindingLoopback`: third loopback type minting the
     `Worktree` RpcTarget.
   - `describeBinding`: returns the agent-API section of `worktree.d.ts` (the
@@ -201,10 +208,12 @@ agent-facing `Worktree` binding API).
 - **`Worktree` binding API** (finalize `worktree.d.ts`; the `TODO(now)` file ops):
   - `listFiles(path?, options?: {recursive?: boolean}) → WorktreeEntry[]` (name,
     type file/dir, size).
+XXX Maybe rename `WorktreeEntry` -> `FileMetadata`
   - `readFile(path) → string`, `writeFile(path, text)`, `deleteFile(path)` — text
     oriented; writes/deletes are OT rows exactly like the file tools' (they go
     through the same append hook, so replay and the UI-someday subscription see
     them).
+XXX This forces all changes to be made by read-modify-write of the whole file. That may be OK, but we should at least specify that overwriting a file will generate OTs based on diffing the content, rather than a single OT that rewrites the entire content.
   - `grep(path, pattern)` / `structuredGrep(path, pattern)` — regex over a file or
     recursively over a directory; **one batched fetch** fills any missing blobs
     before matching; files over the size cap (and binaries) are skipped, with a note
@@ -216,6 +225,7 @@ agent-facing `Worktree` binding API).
     identity from the chat owner via `commitIdentityForAuthor`. The returned oid is
     naturally replay-stable: executeCode results are recorded, and content-addressed
     writes are idempotent across crashes.
+XXX There is no need to "diff headCommit -> pinBase", since git commits are not diff-based. We can create a commit exactly the same way that `mergeChanges()` would, except that we specify the parent commit as being the head commit rather than the pin commit.
   - `diff(commitId?) → string` — unified diff of current content vs. the given
     commit (default `headCommit`). Needs a small git-style unified-diff formatter
     (new utility; we have diff engines but no printer). `commitId` may be any local
@@ -275,8 +285,10 @@ agent-facing `Worktree` binding API).
 - The `gatekeeper.ts` types from 2500f71 land essentially as sketched, with:
   - `putMany()` (or the pipelining note) on `GitCache`.
   - `GitPullHints.commitHistory` optional, defaulting to `{kind: "depth", depth: 1}`.
+XXX Honestly this is a weird default. Most people would probably expect the default to be "full" -- but of course, we never actually intend to request "full". I would just keep this field required.
   - Doc comments to the kernel review bar on every export; `@validateRpc()` per
     repo convention on RPC interfaces.
+XXX `@validateRpc()` goes on implementations, not interfaces -- I've updated AGENTS.md to reflect this. Sorry for the confusion.
 - `worktree.d.ts` finalized per §2 (file ops filled in, commit-squash semantics
   documented from the *agent's* point of view — i.e. not documented at all: the API
   simply reports the last explicit commit as HEAD).
@@ -285,6 +297,7 @@ agent-facing `Worktree` binding API).
 ## Constants (tunable, named in one place)
 
 - `EAGER_BLOB_LIMIT` — blob size fetched eagerly at worktree creation (~256KB).
+XXX Let's make it 64KB.
 - `MAX_WORKTREE_FILE_SIZE` — hard per-file support cap (~1MB; must respect the
   existing `MAX_FILE_TEXT_LENGTH` UTF-16 and 2MB-record constraints).
 
