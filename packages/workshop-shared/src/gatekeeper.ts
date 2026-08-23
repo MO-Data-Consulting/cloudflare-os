@@ -797,6 +797,30 @@ export interface Gatekeeper<Session> extends DurableObject {
   /** Returns the provider for describe().hasSlashCommands, if supported. */
   getSlashCommandProvider?(): Promise<SlashCommandProvider>;
 
+  /**
+   * Request that the gatekeeper populate the git cache with the given objects (e.g., a git
+   * commit), as well as related objects (e.g., the commit's file tree, parents, etc.).
+   *
+   * The overseer will only ever pull objects that it knows the gatekeeper has, for one of the
+   * following reasons:
+   * * The object was referenced by `ObservationDescription.gitCommits` for an observation made
+   *   through this gatekeeper.
+   * * The object was referenced by another object populated by this gatekeeper (e.g. it is the
+   *   parent of another commit from this gatekeeper).
+   * * The object had been populated by this gatekeeper in the past, but was subsequently evicted
+   *   from the cache.
+   *
+   * The Gatekeeper must put() each of the given objects into the cache (or throw an exception). It
+   * MAY also put other related objects into the cache. `hints` provides hints about what objects
+   * the caller would like to have prefetched into the cache, but the gatekeeper is not technically
+   * required to honor these hints. (Failing to prefetch related objects may lead to performance
+   * problems, however.)
+   *
+   * If the gatekeeper ever populates `ObservationDescription.gitCommits`, it MUST implement
+   * `gitPull()`. Otherwise, it can leave the method unimplemented.
+   */
+  gitPull?(oids: GitOid[], cache: GitCache, hints: GitPullHints): Promise<void>;
+
   // ---------------------------------------------------------------------------
   // Callbacks invoked by the overseer to apply (or reject) actions that were previously queued
   // for approval via the ApprovalQueue.
@@ -866,6 +890,13 @@ export interface ObservationAuthorizer extends RpcTarget {
    * data to the gadget, this is OK.
    */
   authorizeObservation(description: ObservationDescription): Promise<void>;
+
+  /**
+   * Get the workspace's git cache. The gatekeeper may optionally use this to pre-populate the
+   * cache with observed commits. If it does not do so, then the commits will be pulled when
+   * first needed (see `Gatekeeper.gitPull()`).
+   */
+  getGitCache(): Promise<GitCache>;
 }
 
 /**
@@ -1056,6 +1087,17 @@ export type ObservationDescription = {
    * consider before approving.
    */
   description: string;
+
+  /**
+   * If present, the observation references one or more git commits which may be pulled from this
+   * gatekeeper.
+   *
+   * Each string in the list is a git commit ID. The overseer will record that these commits may
+   * be pulled from this provider, if needed. If the commit is found to be needed in the future
+   * (e.g. because the agent requests to mount it as a workpiece), the overseer will pull the
+   * commit (and possibly parents) from this gatekeeper, into the workspace's local git repo.
+   */
+  gitCommits?: string[];
 
   // ----------------------------------------------------------------------------
   // Policy hints
@@ -1280,4 +1322,108 @@ export interface HookInitiator<Hook extends RpcTarget> extends WorkerEntrypoint 
    * causes side effects, which should be registered as actions.
    */
   startHook(): Promise<{callback: RpcStub<Hook>, approvalQueue: RpcStub<ApprovalQueue>}>;
+}
+
+/**
+ * git object name, aka "oid", aka "hash" (or "commit id/hash" when it refers to a commit
+ * specifically).
+ */
+export type GitOid = string;
+
+/**
+ * Types of git objects.
+ *
+ * (The "tag" type is a tag annotation object; this type isn't really used by Cloudflare OS
+ * workspaces but is included here because it is one of the four git object types.)
+ */
+export type GitObjectType = "commit" | "tree" | "blob" | "tag";
+
+/**
+ * Interface to the workspace's git object cache.
+ *
+ * Each workspace maintains a cache of git objects, i.e. commits and their file trees. This cache
+ * is used to store code backing gadgets as well as local checkouts of git repositories that the
+ * agent is working on.
+ *
+ * Any gatekeeper that provides access to a remote git repo should populate the workspace's git
+ * cache with objects from that repo. This allows the gatekeeper's API to pass around git object
+ * IDs (especially commit IDs) without having to provide a whole API for reading the content.
+ * An agent can mount a git commit ID as a workpiece, read and edit the files, create new commits,
+ * and pass those commit IDs back into the gatekeeper, perhaps to push up to the remote repo.
+ *
+ * Note that the git cache does NOT include the classic git "ref" layer, i.e. it does not track
+ * branches, tags, etc. It is entirely up to a gatekeeper to provide an API for that if desired.
+ *
+ * The workspace may evict objects from the cache. It expects that after doing so, it can later
+ * repopulate it by "pulling" it from the same gatekeeper -- see `Gatekeeper.gitPull()`. The
+ * Workspace also expects that if it received a particular object from a particular Gatekeeper, it
+ * can also pull all the objects referenced by that object (e.g. a commit's parent, or its file
+ * tree) from the same gatekeeper. Thus, the workspace can lazily populate the stuff that it needs.
+ */
+export interface GitCache {
+  /**
+   * Read the given git object from the cache. Returns null if not present.
+   *
+   * `content` is strictly the object payload. It does NOT include the `<type> <size>\0` header,
+   * even though that header is included in the hash.
+   */
+  get(id: GitOid): Promise<{type: GitObjectType, content: Uint8Array} | null>;
+
+  /** Return whether the given object exists in cache. */
+  has(id: GitOid): Promise<boolean>;
+
+  /** Return the type and byte size of the given object, if it is in cache. */
+  stat(id: GitOid): Promise<{type: GitObjectType, size: number} | null>;
+
+  /**
+   * Add an object to cache. Returns the computed oid.
+   *
+   * As with `get()`, the `content` must NOT include the `<type> <size>\0` header.
+   *
+   * This interface is intentionally designed to make it impossible to poison the cache. If the
+   * returned oid doesn't match what the gatekeeper expected, it should probably throw an
+   * exception.
+   */
+  put(type: GitObjectType, content: Uint8Array): Promise<GitOid>;
+
+  // TODO: putStream() method for large blobs?
+  // TODO: pull() method which populates missing cache entries by pulling them immediately from
+  //   the appropriate gatekeeper? May not be useful since a gatekeeper probably shouldn't be
+  //   requesting oids that originated from other gatekeepers?
+}
+
+/**
+ * Hints provided to Gatekeeper.pull() which may help the gatekeeper decide how much to pull.
+ *
+ * The options are designed with the details of the standard git protocol in mind.
+ */
+export type GitPullHints = {
+  /** The expected type of object. The overseer always knows what it is requesting. */
+  type: GitObjectType;
+
+  /**
+   * Name of the object that referenced this one. E.g. a tree may be referenced by a commit or
+   * a parent tree. A commit may be referenced by a child commit. This is always an oid that was
+   * previously put() by this same gatekeeper.
+   */
+  referencedBy?: GitOid;
+
+  /** How far back in the commit history to go. */
+  commitHistory:
+    | { kind: "full" }
+    | { kind: "depth", depth: number }
+    | { kind: "since", since: Date };
+
+  /** Omit blobs of at least this size. 0 = do not fetch blobs at all. */
+  filterBlobSize?: number;
+
+  /**
+   * Omit trees deeper than this.
+   *
+   * 0 = Don't fetch any trees (implies no blobs either).
+   * 1 = Only fetch the root at each commit.
+   * 2 = Only fetch the root and first-level subdirectories.
+   * n = ...
+   */
+  filterTreeDepth?: number;
 }
