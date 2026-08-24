@@ -240,13 +240,18 @@ agent-facing `Worktree` binding API).
   - Agent tools: worktrees are always pinned, so reads are session-content reads
     (unstamped — the `observedCommit`/elision matrix never applies), and the
     read-before-edit gate works as-is. `writeFile`/`editFile` emit ordinary OT rows.
-  - **System prompt**: one line per existing worktree (name, source repo, head
-    commit) but **never** its file list — repo-scale lists don't belong in the
-    prompt. No worktrees exist at chat start, but the prompt is rebuilt every turn,
-    so turns after creation do list them — cheap insurance for post-compaction turns
-    where the creation tool result may have been summarized away. Discovery goes
-    through the binding API (and grep).
-XXX Are you sure the system prompt can *change* turn-to-turn? If so this is actually pretty bad as it breaks the prompt cache. I thought that the system prompt was based on the starting state of the chat, and the agent was expected to understand how the state had changed based on the chat history. After a compaction, though, it makes sense that the system prompt should update, since the agent no longer sees the pre-compaction history (and, of course, the prompt cache is lost at compaction anyway).
+  - **System prompt: worktrees are never mentioned.** The prompt aims to be
+    byte-stable across a chat's turns for prompt caching (the seed binding layer is
+    frozen per chat for exactly this reason, agent.ts:1325-1334; mid-chat
+    acquisitions are announced via chat history, not the prompt). Since worktrees
+    are created mid-chat by the agent itself, the `createWorktree` call and tool
+    result in the chat history *are* the announcement; adding a prompt line would
+    self-inflict a cache miss on every turn after a creation. Post-compaction,
+    knowledge of the worktree rides the handoff summary like every other mid-chat
+    acquisition (the checkpoint's `chatBindings` keep the binding functional, and
+    `describeBinding`/`listFiles` let the agent re-orient). File lists obviously
+    don't belong in the prompt either — discovery goes through the binding API
+    (and grep).
   - `getEnvForAgent`/`makeBindingLoopback`: third loopback type minting the
     `Worktree` RpcTarget.
   - `describeBinding`: returns the agent-API section of `worktree.d.ts` (the
@@ -282,16 +287,20 @@ XXX Are you sure the system prompt can *change* turn-to-turn? If so this is actu
     before matching; files over the size cap (and binaries) are skipped, with a note
     in the output. (`RegExp` params are fine: the binding is served over Workers RPC
     inside the server, which has always supported RegExp serialization.)
-  - `commit(message) → oid` — build the tree exactly the way `mergeChanges` would,
-    except from the pin: `writeChangedFilesAsCommit({treeBase: pinBase, parents:
-    [headCommit]}, overlayTouchedPaths)`. Current content ≡ `pinBase` tree +
-    current-epoch overlay, so the overlay's touched paths are the *only* changes to
-    apply — no diff computation anywhere. Advance `headCommit` (and `pinBase`) to
-    the new commit. Commit identity from the chat owner via
-    `commitIdentityForAuthor`. The returned oid is naturally replay-stable:
-    executeCode results are recorded, and content-addressed writes are idempotent
-    across crashes.
-XXX The above bullet point has gotten kind of hard to understand (written in "Claudish"), could you rephrase it? In particular the fact that the new commit lists the head commit as its parent is technically covered but sort of de-emphasized; this is important!
+  - `commit(message) → oid` — writes a real git commit capturing the worktree's
+    current content. **The new commit's parent is `headCommit`, the last explicit
+    commit.** This parent choice is what implements the squash: if accepts have
+    advanced `pinBase` through auto-commits since the last explicit commit, those
+    auto-commits simply never appear in the new commit's ancestry. The tree is
+    built the same way `mergeChanges` builds one — since the current content is by
+    definition `pinBase`'s tree with the current epoch's overlay applied,
+    `writeChangedFilesAsCommit({treeBase: pinBase, parents: [headCommit]},
+    overlayTouchedPaths)` produces it directly, with no diff computation. Both
+    `headCommit` and `pinBase` then advance to the new commit. Commit identity
+    comes from the chat owner (`commitIdentityForAuthor`). Replay is safe:
+    executeCode results are recorded, so the call never re-executes on replay, and
+    the object writes are content-addressed and idempotent, so a crash mid-commit
+    cannot produce divergent state.
   - `diff(commitId?) → string` — unified diff of current content vs. the given
     commit (default `headCommit`). Needs a small git-style unified-diff formatter
     (new utility; we have diff engines but no printer). `commitId` may be any local
@@ -447,7 +456,8 @@ to be decided later.
    paths), `createWorktree` tool (local + metadata prefix resolution,
    gatekeeper-free commits allowed, initial pull, recorded output, birth pin,
    pending lifecycle), the four dispatch seams, lazy content for worktree roots in
-   `buildChatContent`/session content, system-prompt one-liner. Tests:
+   `buildChatContent`/session content (no system-prompt changes — worktrees are
+   announced by their own tool results). Tests:
    create/replay determinism, create-from-local-commit (no gatekeeper),
    edit-through-OT on a worktree, lazy blob fault, oversize/binary read errors,
    revert-deletes-worktree, chat-deletion cleanup, other-chat invisibility, no
