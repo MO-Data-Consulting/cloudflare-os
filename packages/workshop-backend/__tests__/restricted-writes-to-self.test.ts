@@ -2,7 +2,8 @@
 // the connections that produced its restricted data (sending the data back where it came from
 // reveals nothing new), while any other target is refused before a record is written. Latched
 // actions are never auto-approved -- even a write-to-self with a matching rule must pend for a
-// human (see autoApprovalRule).
+// human (see autoApprovalRule). An action naming a removed connection is refused outright,
+// latched or not: a pending action on a dead connection could never be approved or rejected.
 //
 // Runs against a real OverseerDurableObject (the TEST_OVERSEER binding, like
 // restricted-producer-removal.test.ts) so submitAction reads real storage; records are seeded
@@ -123,6 +124,40 @@ describe("submitAction under the restricted-data latch", () => {
 
       await expect(impl.submitAction(2, 0, pokeDescription(), CALLER))
           .rejects.toThrow(/only perform actions on those same connections/i);
+      expect(actionStates(impl)).toEqual([]);
+      expect(impl.storage.nextActionId.get()).toBe(nextActionId);
+    });
+  });
+
+  it("refuses a latched action on a removed producer, writing no record", async () => {
+    let stub = env.TEST_OVERSEER.getByName("writes-to-self-removed-producer");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedGatekeeper(impl, 1);
+      seedRestrictedObservation(impl, 1, 100);
+      // The producer is removed, but restrictedProducerIds still contains it (it scans the
+      // never-deleted action log). Set membership must not admit the write: a pending action on a
+      // removed connection could never be approved or rejected.
+      impl.storage.gatekeepers.delete(1);
+      let nextActionId = impl.storage.nextActionId.get();
+
+      await expect(impl.submitAction(1, 0, pokeDescription(), CALLER))
+          .rejects.toThrow(/has been removed from this workspace/i);
+      expect(actionStates(impl)).toEqual([]);
+      expect(impl.storage.nextActionId.get()).toBe(nextActionId);
+    });
+  });
+
+  it("refuses an unlatched action on a removed connection, writing no record", async () => {
+    let stub = env.TEST_OVERSEER.getByName("writes-to-self-removed-unlatched");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedGatekeeper(impl, 1);
+      impl.storage.gatekeepers.delete(1);
+      let nextActionId = impl.storage.nextActionId.get();
+
+      await expect(impl.submitAction(1, 0, pokeDescription(), CALLER))
+          .rejects.toThrow(/has been removed from this workspace/i);
       expect(actionStates(impl)).toEqual([]);
       expect(impl.storage.nextActionId.get()).toBe(nextActionId);
     });
