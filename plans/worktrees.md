@@ -246,6 +246,7 @@ agent-facing `Worktree` binding API).
     so turns after creation do list them — cheap insurance for post-compaction turns
     where the creation tool result may have been summarized away. Discovery goes
     through the binding API (and grep).
+XXX Are you sure the system prompt can *change* turn-to-turn? If so this is actually pretty bad as it breaks the prompt cache. I thought that the system prompt was based on the starting state of the chat, and the agent was expected to understand how the state had changed based on the chat history. After a compaction, though, it makes sense that the system prompt should update, since the agent no longer sees the pre-compaction history (and, of course, the prompt cache is lost at compaction anyway).
   - `getEnvForAgent`/`makeBindingLoopback`: third loopback type minting the
     `Worktree` RpcTarget.
   - `describeBinding`: returns the agent-API section of `worktree.d.ts` (the
@@ -290,6 +291,7 @@ agent-facing `Worktree` binding API).
     `commitIdentityForAuthor`. The returned oid is naturally replay-stable:
     executeCode results are recorded, and content-addressed writes are idempotent
     across crashes.
+XXX The above bullet point has gotten kind of hard to understand (written in "Claudish"), could you rephrase it? In particular the fact that the new commit lists the head commit as its parent is technically covered but sort of de-emphasized; this is important!
   - `diff(commitId?) → string` — unified diff of current content vs. the given
     commit (default `headCommit`). Needs a small git-style unified-diff formatter
     (new utility; we have diff engines but no printer). `commitId` may be any local
