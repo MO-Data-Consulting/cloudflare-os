@@ -26,6 +26,12 @@ const PANE_BAR = 'flex h-9 flex-shrink-0 items-center border-b border-kumo-line'
 
 interface ActivityProps {
   overseer: RpcStub<Overseer>
+  // True once the workspace has read restricted data (GadgetMetadata.containsRestrictedData, live
+  // via the metadata subscription). Latched actions are never auto-approved (the backend's
+  // setAutoApprovedActionKind also throws), so the review tab suppresses the always-approve
+  // affordance and the auto-approval panel annotates existing rules as suspended. Rules stay
+  // listed and disable-able: a standing grant must remain revocable.
+  restricted?: boolean
   view: ActivityView
   onViewChange: (view: ActivityView) => void
   onAutoApproveChange?: () => void
@@ -152,6 +158,7 @@ function ActivityNotice({ icon, title, description, children }: {
 
 export default function Activity({
   overseer,
+  restricted,
   view,
   onViewChange,
   onAutoApproveChange,
@@ -225,6 +232,9 @@ export default function Activity({
           <div className="min-h-0 flex-1 overflow-auto">
             {pendingActions.map(record => {
               const autoApproveTarget =
+                // A restricted workspace never auto-approves, so don't offer a rule that could
+                // only error.
+                !restricted &&
                 record.type === 'action' && record.gatekeeperId !== undefined &&
                 record.description.actionKind !== undefined &&
                 record.description.autoApprovable === true &&
@@ -426,7 +436,13 @@ export default function Activity({
           </>
         )
       case 'auto':
-        return <AutoApprovalPanel overseer={overseer} reloadTrigger={autoApproveReloadTrigger} />
+        return (
+          <AutoApprovalPanel
+            overseer={overseer}
+            restricted={restricted}
+            reloadTrigger={autoApproveReloadTrigger}
+          />
+        )
     }
   }
 
@@ -455,9 +471,11 @@ export default function Activity({
 
 function AutoApprovalPanel({
   overseer,
+  restricted,
   reloadTrigger,
 }: {
   overseer: RpcStub<Overseer>
+  restricted?: boolean
   reloadTrigger?: number
 }) {
   const { entries, isLoading, loadError, pending, refresh, setEnabled } = useAutoApproval(overseer)
@@ -570,17 +588,23 @@ function AutoApprovalPanel({
                       {entry.actionKind.label}
                     </span>
                     <span className="mt-0.5 block text-[12px] leading-4 tracking-[-0.2px] text-kumo-inactive">
-                      {entry.orphaned
-                        ? 'This connection no longer offers this action; the rule still applies.'
-                        : entry.enabled
-                          ? 'Applied without asking'
-                          : 'Waits for your approval'}
+                      {restricted
+                        // Rules never apply while the workspace is restricted (autoApprovalRule
+                        // refuses), so don't claim they do -- but keep them listed and revocable.
+                        ? "Won't apply: this workspace has read sensitive data, so actions always require manual approval."
+                        : entry.orphaned
+                          ? 'This connection no longer offers this action; the rule still applies.'
+                          : entry.enabled
+                            ? 'Applied without asking'
+                            : 'Waits for your approval'}
                     </span>
                   </span>
                   <Switch
                     size="sm"
                     checked={entry.enabled}
-                    disabled={busy}
+                    // While restricted, enabling would only error (setAutoApprovedActionKind
+                    // throws), but disabling must stay possible: a standing grant is revocable.
+                    disabled={busy || (restricted === true && !entry.enabled)}
                     aria-label={`${entry.enabled ? 'Disable' : 'Enable'} auto-approval for ${entry.actionKind.label}`}
                     onCheckedChange={enabled => void setEnabled(entry, enabled)}
                   />
