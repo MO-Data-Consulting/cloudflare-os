@@ -1079,9 +1079,13 @@ export type ObservationDescription = {
    *   these observations.
    * - Once observed, the gadget enters a restricted mode: it may no longer fetch from the
    *   public web, and it may only perform actions that target a gatekeeper that itself produced
-   *   a sensitive observation (writes-to-self -- sending the data back where it came from
-   *   reveals nothing new), each requiring manual human approval (never auto-approved). This
-   *   prevents the gadget from leaking the data through other gatekeepers.
+   *   a sensitive observation (writes-to-self), each requiring manual human approval (never
+   *   auto-approved). This prevents the gadget from leaking the data through other gatekeepers.
+   *   Note the carve-out is per-connection set membership, not data provenance: with multiple
+   *   restricted producers, data observed through one may be written back through another, and
+   *   even a single connection can reach audiences beyond where the data was read (e.g. a broad
+   *   account writing to a more public destination). The mandatory human approval of every such
+   *   action is the interim mitigation for those cases.
    *
    * TODO(someday): The restricted mode is a blunt instrument. It should be possible to perform
    *   actions whose visibility is limited to people verified to have access to the same data,
