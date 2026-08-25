@@ -444,6 +444,27 @@ describe("sensitive observations", () => {
     });
   });
 
+  it.concurrent("a connection with pending approval requests cannot be removed", async () => {
+    await withSession(async publicApi => {
+      const ws = await newWorkspace(publicApi, "remove-pending");
+
+      // Queue an action; it pends for manual approval. Removing the connection now would delete
+      // the facet both approval and rejection resolve through, stranding the record forever.
+      await expect(ws.session.doThing()).resolves.toBeUndefined();
+      const gatekeeper = await ws.overseer.getGatekeeperById(ws.gatekeeperId);
+      await expect(gatekeeper.remove()).rejects.toThrow(/pending approval requests/i);
+      // The refused removal left the connection intact.
+      await expect(ws.session.readThing()).resolves.toContain("remove-pending");
+
+      // Denying the action resolves it, which unblocks the removal.
+      const { entries } = await ws.overseer.listActions();
+      const pending = entries.find(a => a.type === "action" && a.state === "pending");
+      if (!pending) throw new Error("The submitted action is not pending");
+      await ws.overseer.rejectAction(pending.id);
+      await expect(gatekeeper.remove()).resolves.toBeUndefined();
+    });
+  });
+
   it.concurrent("a latched connection cannot be removed while the workspace is shared",
       async () => {
     await withSession(async publicApi => {

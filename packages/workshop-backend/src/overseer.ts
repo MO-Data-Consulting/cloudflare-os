@@ -4404,6 +4404,19 @@ class OverseerImpl implements AgentHooks {
   // no gadget's env retains a dangling entry. (This is distinct from merely unbinding it from one
   // gadget -- GadgetClient.unbind() -- which leaves the gatekeeper alive, possibly orphaned.)
   removeGatekeeper(id: number) {
+    // A pending action is resolvable only through the facet this method deletes -- both
+    // applyPendingAction and rejectAction dereference it -- so removal would strand the record
+    // "pending" forever and suspend an awaitDecision agent turn with it. Refuse before any
+    // mutation (binding edges are severed below); submitAction's existence check covers the
+    // submit side. Synchronous with the delete, like submitAction's check-and-put block, so one
+    // always sees the other. The addGatekeeper failure cleanup passes vacuously: no session has
+    // ever been handed out there, so no action can name the id.
+    if (this.hasPendingActions(id)) {
+      throw new Error(
+          "This connection cannot be removed while it has pending approval requests. Approve or " +
+          "deny them first.");
+    }
+
     for (let gadget of Array.from(this.storage.gadgets.list())) {
       let names = Object.entries(gadget.bindings)
           .filter(([, edge]) => edge.target === id)
@@ -4705,6 +4718,19 @@ class OverseerImpl implements AgentHooks {
       }
     }
     return producers;
+  }
+
+  // True if any pending approval request names connection `id`. Scans the action log like
+  // restrictedProducerIds above, and for the same reason it's acceptable: the callers are cold
+  // paths (connection removal and the ambient reconcile). Used to refuse removing a connection
+  // whose pending actions could then never be resolved -- see removeGatekeeper.
+  hasPendingActions(id: WorkpieceId): boolean {
+    for (let record of this.storage.actions.list()) {
+      if (record.type === "action" && record.state === "pending" && record.gatekeeperId === id) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // True if removing gatekeeper `id` is blocked because it anchors restricted-data verification:
@@ -6416,6 +6442,15 @@ class OverseerImpl implements AgentHooks {
         // binding name, and the dead record's session just fails).
         this.logger.warn("skipping removal of stale ambient restricted producer", {
           event: "singleton.capsules.reconcile.blocked",
+          gatekeeperId: gk.id,
+          vendorId: gk.creationSpec.vendorId,
+        });
+      } else if (this.hasPendingActions(gk.id)) {
+        // removeGatekeeper refuses while approval requests are pending (resolving them needs the
+        // facet it deletes), so defer this stale capsule to a later reconcile rather than throw
+        // out of open(). Not added to `bound`, same as the restricted-producer skip above.
+        this.logger.warn("skipping removal of stale ambient capsule with pending actions", {
+          event: "singleton.capsules.reconcile.pending.actions",
           gatekeeperId: gk.id,
           vendorId: gk.creationSpec.vendorId,
         });
