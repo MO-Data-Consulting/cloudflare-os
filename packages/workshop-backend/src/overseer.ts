@@ -100,7 +100,7 @@ export default class extends WorkerEntrypoint {
       }
     }
     let result = await agent(self, env, this.ctx);
-    if (result !== undefined) console.log(result);
+    if (result !== undefined) console.log("Return value:", result);
   }
 }
 `;
