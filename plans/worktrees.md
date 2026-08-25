@@ -12,12 +12,14 @@ resulting commit ids back into the gatekeeper (e.g. to push a branch or open a P
 Supporting cast:
 
 - A **git cache** layer over the workspace's existing git object store, with
-  **provenance tracking** (which gatekeeper each object can be pulled from) and lazy
-  **pull-on-fault** plumbing (`Gatekeeper.gitPull()`).
+  **provenance tracking** (which gatekeeper each object can be pulled from), lazy
+  **pull-on-fault** plumbing (`Gatekeeper.gitPull()`), and **push authorization**
+  (`ActionDescription.pushedCommits`, verified and marked at `submitAction`).
 - **GitHub gatekeeper git operations**: enumerate branches/tags, look up commits
   (including truncated ids), enumerate commit histories and PR commits, push commits
   to a branch, create PRs from pushed commits — every commit-returning observation
-  populating `ObservationDescription.gitCommits`.
+  populating `ObservationDescription.gitCommits`, every push declaring
+  `ActionDescription.pushedCommits`.
 
 The starting point is the sketch in commit 2500f71, encompassing changes in
 `workshop-shared/src/gatekeeper.ts` (`GitOid`/`GitObjectType`/`GitCache`/
@@ -96,7 +98,31 @@ agent-facing `Worktree` binding API).
   git-data re-creates objects server-side from JSON; any serialization difference
   yields a different SHA than the commit id the agent holds, silently breaking the
   "push the commit I made" contract. Sending our exact bytes in a pack guarantees oid
-  fidelity.
+  fidelity. The pack bytes themselves are composed overseer-side
+  (`GitCache.buildPack()`, §1); the gatekeeper contributes only send-pack framing
+  and the ref-update command.
+- **Push authorization is declared on the action and enforced at `submitAction` —
+  there are no read-time rules and no gatekeeper-induced pulls.**
+  `ActionDescription.pushedCommits` names the commits an action will push; before
+  queuing, the overseer verifies that their ancestry reaches commits *proven* on
+  that gatekeeper's remote and marks the push closure "pending push" (§1). The
+  gatekeeper's whole cache view is then trivial: `get()`/`has()`/`stat()` answer
+  for objects proven on its remote plus objects pending push to it, and nothing
+  else. Proof means hash-verified bytes — a `put()` from that gatekeeper or a
+  successful push to it; an advertisement is just an assertion and never
+  qualifies (§1's metadata grades). The design serves two purposes, and neither
+  is defense against a hostile gatekeeper (see the trust-model watch-for): the
+  ancestry rule is a **safeguard against agent and user mistakes** — an
+  accidental push to an unrelated remote fails closed at queue time with an
+  agent-visible error (relatedness is proven by first pulling a shared ancestor
+  from the destination, which is also what keeps pushes from ever needing to
+  un-shallow the cache) — and the pending-push view is exactly what the
+  gatekeeper needs to **simulate a not-yet-approved push**. Beyond those two,
+  the tight view is least-authority hygiene rather than a security boundary.
+  Versus the read-time-rules and `GitCache.ensure()` designs this replaced:
+  repo *copying* stays structurally out of scope (cross-remote transfer moves
+  only a verified push closure, batched at apply), and everything happens at
+  the same chokepoint every other gatekeeper effect already flows through.
 - **Trees eager; blobs eager under a modest size limit.** Worktree creation pulls the
   commit, its full tree structure, and all blobs under `EAGER_BLOB_LIMIT` in one fetch
   (`filter blob:limit=…`). Larger blobs fault in on first access (GitHub is slow;
@@ -112,7 +138,7 @@ agent-facing `Worktree` binding API).
 - **Lazy reads are a hand-rolled walker, not isomorphic-git.** The new
   read-on-demand paths (per-path tree walk, entry listing, commit header reads) parse
   git objects themselves and call `ensureObject(oid, {type, referencedBy})` before
-  each step, so pull hints and transitive provenance fall out of the walk naturally.
+  each step, so pull hints fall out of the walk naturally.
   isomorphic-git's fs shim only ever sees a bare oid path — it knows neither the
   expected type nor the `referencedBy` chain that `GitPullHints` wants — and the
   parsing is genuinely trivial (blob = raw bytes; tree = repeated
@@ -123,8 +149,9 @@ agent-facing `Worktree` binding API).
   over the same store.
 - **No eviction yet.** The `GitCache` contract *permits* eviction (that's why
   provenance exists — evicted objects are re-pullable), but v1 implements none.
-  Provenance metadata is the future re-pull index; gadget-history objects remain
-  rooted by records/pins as documented in git-store.ts.
+  The metadata rows (`onRemote`/`pullableFrom`, §1) are the future re-pull index;
+  gadget-history objects remain rooted by records/pins as documented in
+  git-store.ts.
 
 ## Current-state anchors (for orientation)
 
@@ -151,77 +178,156 @@ agent-facing `Worktree` binding API).
 
 ## Design
 
-### 1. Git cache + provenance (workshop-backend)
+### 1. Git cache + provenance + push authorization (workshop-backend)
 
 - **`GitCacheImpl`** implements the shared `GitCache` interface over the existing
   `gitObjects` collection. The cache API speaks `(type, headerless payload)`;
-  storage stays zlib'd whole loose objects. `put()` computes the SHA-1 of
-  `<type> <size>\0` + payload itself and stores under that oid — poison-proof by
-  construction; a gatekeeper that gets back an unexpected oid should probably throw.
-  No `putMany` batch method: the cache stub a gatekeeper holds is a facet-to-parent
-  stub (always local), and callers are free to issue many `put()`s in parallel
-  rather than awaiting each serially — doc-comment this on `put()`.
-- **`gitObjectMetadata` collection**: one row per oid —
-  `{oid, type?, size?, gatekeeperIds: WorkpieceId[]}` (array of gatekeeper ids
-  rather than one row per pair, the idiomatic typed-storage shape). `gatekeeperId`
-  is the `GatekeeperRecord`'s `WorkpieceId` (the gatekeeper DO is per-resource, so
-  it identifies the repo too); multiple gatekeepers may claim the same oid. Kept
-  separate from `gitObjects` for two reasons: reading a `gitObjects` row means
-  reading the whole object content, which is wasteful when only metadata is wanted;
-  and metadata can exist for objects we *don't* hold — commits advertised by an
-  observation but never pulled, and oversized blobs we declined to store (recording
-  their size lets a later `stat()`/read fail fast instead of refetching). Rows are
-  written at:
-  1. `authorizeObservation`, when `ObservationDescription.gitCommits` is present —
-     the advertised commits become pullable from that gatekeeper.
-  2. `GitCacheImpl.put()` during a `gitPull` — type/size recorded, the pulling
-     gatekeeper added to `gatekeeperIds` (everything a gatekeeper supplies is
-     re-pullable from it — the "populated in the past, since evicted" case).
-  3. The lazy walker, for transitive references (a pulled commit's tree, a tree's
-     subtrees/blobs): `ensureObject`'s `referencedBy` chain propagates provenance
-     as it walks.
+  storage stays zlib'd whole loose objects. The stub is minted **per-gatekeeper**
+  — it identifies the writer for metadata recording and scopes the read view:
+  - `put()` computes the SHA-1 of `<type> <size>\0` + payload itself and stores
+    under that oid — poison-proof by construction; a gatekeeper that gets back an
+    unexpected oid should probably throw. A verified `put()` doubles as the
+    system's **proof of possession**: it is what earns the putter an `onRemote`
+    mark (below). No `putMany` batch method: the cache stub a gatekeeper holds is
+    a facet-to-parent stub (always local), and callers are free to issue many
+    `put()`s in parallel rather than awaiting each serially — doc-comment this on
+    `put()`.
+  - `get(oid, hints?)` — and `has()`/`stat()` identically; the view is uniform
+    across all three — answers **exactly** `onRemote(G) ∪ pendingPush(G)` for
+    the calling gatekeeper G, null for everything else. Null is deliberately
+    uniform: "not something this gatekeeper is involved with" and "on your own
+    remote — ask it yourself, that's your job" look the same, and the fallback
+    behaves correctly either way. A `pendingPush(G)` object that is locally
+    absent is **pulled through** from its recorded source on demand — this is
+    what lets the gatekeeper simulate a queued cross-remote push as if it had
+    already landed; an absent `onRemote(G)` object is *not* pulled (null). The
+    optional `hints: GitPullHints` are advisory prefetch for that pull-through,
+    so a gatekeeper walking objects by hand doesn't fault once per `get()`
+    (defaults: exact-object, type from metadata). Doc-comment the simulation
+    contract: a returned commit that is pending push should be treated, for
+    simulation purposes, as already pushed.
+  - `buildPack()` returns a `ReadableStream` of an undeltified packfile (SHA-1
+    trailer) carrying the applying action's full pending-push closure. It takes
+    **no arguments**: the commit list is the action's own
+    `ActionDescription.pushedCommits`, and the method exists only on the
+    **action-scoped** stub passed to `applyAction()` (which carries the action
+    id; a session-time stub has no action and throws) — that binding is what
+    disambiguates overlapping queued pushes, duplicate heads, and multiple
+    actions marking the same oids. Composed overseer-side from the `pushMarks`
+    index (below), so apply needs no per-object RPC. `buildPack()` is
+    responsible for **completing the closure**: any marked object absent from
+    cache is faulted in from its recorded sources (batched), and a faulted
+    tree's arrival propagates marks to its children (the ordinary lazy
+    propagation), which may fault in turn — repeating until no marked object
+    is absent. A mid-stream source-pull failure (provenance loss) fails the
+    apply with the actionable "reconnect X" error. The stream rides
+    facet-to-parent Workers RPC, which carries `ReadableStream` natively; the
+    API deliberately leaves room for a future implementation that streams a
+    source gatekeeper's pack straight through without staging every object.
+- **`gitObjectMetadata` collection**: one row per oid — `{oid, type?, size?,
+  onRemote: WorkpieceId[], pullableFrom: WorkpieceId[], pendingPush:
+  {gatekeeperId: WorkpieceId, actionId}[]}` (arrays rather than one row per pair,
+  the idiomatic typed-storage shape). Gatekeeper ids are the `GatekeeperRecord`'s
+  `WorkpieceId` (the gatekeeper DO is per-resource, so it identifies the repo
+  too); multiple gatekeepers may appear on the same oid. Kept separate from
+  `gitObjects` for two reasons: reading a `gitObjects` row means reading the
+  whole object content, which is wasteful when only metadata is wanted; and
+  metadata routinely exists for objects we *don't* hold — advertised commits,
+  filtered-out tree entries, and oversized blobs we declined to store (recording
+  their size lets a later `stat()`/read fail fast instead of refetching). The two
+  gatekeeper sets differ in **evidentiary grade** — proof versus assertion —
+  which is what keeps the mistake-safeguard reliable:
+  - `onRemote` — *proof* that the gatekeeper's remote possesses the object.
+    Entered only by a hash-verified `put()` from that gatekeeper (during
+    `gitPull`, or opportunistically alongside an observation — a gatekeeper may
+    `put()` a commit's bytes when it stamps `gitCommits`, upgrading its
+    advertisement to proof) or by a successful push to it. This is what
+    `get()` serves, what ancestry verification terminates on, and what the
+    marking walk skips.
+  - `pullableFrom` — unproven *hints*: `ObservationDescription.gitCommits`
+    advertisements (written at `authorizeObservation`), plus the referent oids
+    recorded whenever a gatekeeper `put()`s a tree or commit (each entry / tree
+    pointer / parent, type derived from the entry mode or header — this is what
+    creates rows for objects never fetched, and the sketch's "referenced by
+    another object populated by this gatekeeper" and "populated in the past,
+    since evicted" pull cases). Used for pull routing (which gatekeeper to try)
+    and for the marking walk's remote-known exclusion; grants no reads. A wrong
+    or stale claim only misroutes a pull (which fails, and the next recorded
+    source is tried) or under-fills the claimant's own packs (its own remote
+    then rejects them for missing objects).
+  - `pendingPush` — written by the marking walk (below); the read grant for
+    queued pushes, keyed to the action so it can be cleaned up.
 - **Pull driver** `ensureGitObjects(oids, hints)` in the overseer: look up
-  provenance in `gitObjectMetadata` (trying each recorded gatekeeper on failure),
-  mint the gatekeeper stub through the existing `getGatekeeperClassFor` chokepoint
-  (so disabled gatekeepers/resources stay enforced), call
-  `gitPull(oids, cache, hints)`, verify the requested oids are now present. A
-  deleted gatekeeper record → clear error to the agent ("reconnect X to pull this
-  commit").
+  `onRemote ∪ pullableFrom` in `gitObjectMetadata` (trying each recorded
+  gatekeeper on failure), mint the gatekeeper stub through the existing
+  `getGatekeeperClassFor` chokepoint (so disabled gatekeepers/resources stay
+  enforced), call `gitPull(oids, cache, hints)`, verify the requested oids are
+  now present. A deleted gatekeeper record → clear error to the agent
+  ("reconnect X to pull this commit"). Reachable only from overseer-initiated
+  paths — agent-side faults (worktree creation and lazy reads) and the
+  `get()`/`buildPack()` pull-through of `pendingPush`-marked objects — so a
+  gatekeeper can never direct a pull of anything outside a verified queued push.
 - **Lazy walker** (`ensureObject` + hand-rolled parsers, per the locked decision):
   the read-side codec — loose-object header/inflate helpers shared with
   `GitCacheImpl`, plus tree/commit parsers — powering the new lazy read paths.
   `ensureObject(oid, {type, referencedBy})` checks presence, pulls via
-  `ensureGitObjects` on a miss (recording provenance inherited from
-  `referencedBy`), then parses. Gadget-history reads never fault (their objects are
+  `ensureGitObjects` on a miss (routed by the `pullableFrom` rows that
+  `put()`-time referent recording already wrote; `referencedBy` shapes the pull
+  hints), then parses. Gadget-history reads never fault (their objects are
   always local) and keep using isomorphic-git untouched.
-- **`GitCache.ensure(oid, {type, referencedBy})`** (shared API; resolves the
-  sketch's `pull()` TODO — cross-remote push turned out to be exactly its use
-  case): the push walker's counterpart of the lazy walker's faulting. Returns
-  `"present"` — the object is in the cache, possibly after the overseer pulled it
-  from a *different* gatekeeper's recorded provenance — or `"origin"` — the object
-  is absent but its provenance (recorded metadata, or inherited from
-  `referencedBy`) includes the **calling** gatekeeper itself, meaning that
-  gatekeeper's own remote already has it and no bytes are needed. `type` is
-  required from the caller (a walker always knows it: tree entries carry modes,
-  commits name their tree and parents) because the overseer can't rely on
-  metadata supplying one — an omitted object may have no row at all. Pulls
-  triggered by `ensure` use **type-specific exact-object hints** — a bare
-  depth-1 commit want is *not* exact (it drags in the commit's whole reachable
-  tree and blobs), and a cross-origin push must never materialize a repository
-  as a side effect. Every mapping carries `commitHistory: {kind: "depth",
-  depth: 1}`, since the field is required (doc-comment on `GitPullHints` that it
-  is meaningful only for commit wants and ignored otherwise). Per type: blob →
-  just that (a blob has no children, so the want is exact by itself); tree →
-  plus `{filterTreeDepth: 1, filterBlobSize: 0}` (the tree object alone, no
-  subtrees or blobs); commit → plus `{filterTreeDepth: 0}` (the commit object
-  alone — no-trees implies no blobs).
-  The cache stub is minted per-gatekeeper (it must be anyway, for provenance
-  recording at `put()`), which is what lets it answer "origin" for the caller.
+- **Push authorization at `submitAction`** (resolves the sketch's `pull()` TODO
+  by *deleting* it, along with the `GitCache.ensure()` design that briefly
+  succeeded it): when an `ActionDescription` carries `pushedCommits`, the
+  overseer, before queuing:
+  1. **Verifies ancestry.** Every parent chain from each declared head must
+     reach a commit `onRemote` for this gatekeeper, walking cached commit
+     objects only. An absent ancestor commit is an immediate, agent-visible
+     error ("pull the branch history first" / "pull a shared ancestor from the
+     destination"), and so is a parentless commit that isn't itself `onRemote` —
+     **no vacuous pass for roots**. Pushing derived work back to its origin
+     trivially passes (the worktree's base was pulled from there); pushing to a
+     *related* remote requires first pulling a shared ancestor commit from it,
+     which both proves the repos are related and makes the accidental
+     push-to-the-wrong-remote mistake fail closed at queue time. Verification
+     never needs ancestors *beyond* the proven commits, so shallow pulls stay
+     shallow. The practical v1 bound this implies, stated plainly: the commit
+     chain from head to proven ancestor must already be cached, which in
+     practice means agent-authored commits atop a destination-proven base.
+     Pushing a *pre-existing* branch whose head sits N commits above the shared
+     ancestor requires those N commit objects — a history-deepening pull v1
+     doesn't offer (deep-history pulls are punted) — so the error message
+     should state the limitation plainly rather than send the agent hunting.
+  2. **Marks the push closure.** Walks from the heads to the proven ancestors
+     and through containment (commit → tree → entries), marking every visited
+     object `pendingPush {gatekeeperId, actionId}` — skipping, without
+     descending, objects the remote already has (`onRemote ∪ pullableFrom`;
+     remotes are closed under containment, so nothing beneath a remote-known
+     object needs pushing), and skipping gitlink entries (mode 160000) entirely
+     (submodule commits are never part of a push, and following one would mark a
+     foreign repo's commit). An absent tree/blob that isn't remote-known is
+     still marked; when its bytes later arrive (any `put()`), the mark
+     **propagates lazily** to its referents under the same rules and action id.
+     Marks land on the metadata rows *and* in a non-unique `pushMarks`
+     action-id index, so cleanup and conversion iterate the action's oids
+     without re-walking.
+- **Mark lifecycle.** Applied successfully → the action's marks convert to
+  `onRemote` (the remote provably has them now; they also become re-pullable),
+  idempotently and in the same durable step as the queue's completion record, so
+  a crash between the push and the conversion strands nothing *locally* — the
+  remote side of that same window is the gatekeeper's `applyAction` idempotency
+  responsibility (§3/§4). Rejected /
+  expired / terminally failed → marks removed via the index. Reverting an
+  applied push keeps `onRemote`: the remote genuinely received the objects (the
+  ref rolls back; they go dangling), and the gatekeeper already held the pack.
+  Gatekeeper-record deletion with pushes still queued cleans up like rejection.
 - **`Gatekeeper.applyAction()` gains a `GitCache` parameter.** Approval can happen
   hours after the session that queued the action, so a stub obtained via
   `getGitCache()` at queue time is long gone when the action applies; the overseer
-  passes a fresh per-gatekeeper cache stub with the apply call. Existing
-  gatekeepers simply ignore the extra parameter: the workspace pins
+  passes a fresh cache stub with the apply call, scoped to the gatekeeper **and to
+  the applying action** — the binding `buildPack()` consumes. The read view is
+  unchanged by action scoping (`get`/`has`/`stat` still answer the per-gatekeeper
+  `onRemote ∪ pendingPush` union); the action binding only adds `buildPack`.
+  Existing gatekeepers simply ignore the extra parameter: the workspace pins
   capnweb-validate 0.3.0, whose Schema Evolution contract explicitly allows this
   — "Extra arguments to a validated method are dropped before it runs" (verified
   against the vendored 0.3.0 README; an implementation declaring fewer parameters
@@ -236,6 +342,8 @@ agent-facing `Worktree` binding API).
 - **git-store extensions**:
   - Raw object read/write helpers used by the cache impl and walker
     (inflate/deflate + header split), private to git-store + cache.
+  - Pack writer for `buildPack`: undeltified entries + SHA-1 trailer, streamed
+    over the raw loose objects (deltification/thin packs are future internals).
   - `readFileAtCommit(oid, path)` — per-path tree walk via the lazy walker, no
     full-tree materialization.
   - `listTreeEntries(oid, path?)` / walk helpers for `listFiles` and grep
@@ -246,7 +354,10 @@ agent-facing `Worktree` binding API).
     (`null` = delete). `treeBase` and `parents` are separate parameters: an
     explicit worktree commit builds its tree from `pinBase` but parents on
     `headCommit` (squash semantics). Writes go through isomorphic-git plumbing.
-- `ApprovalQueueImpl` (and `SlashCommandAuthorizerImpl`) implement `getGitCache()`.
+- `ApprovalQueueImpl` (and `SlashCommandAuthorizerImpl`) implement `getGitCache()`;
+  the queue's `submitAction` chokepoint runs the `pushedCommits` ancestry
+  verification + marking walk, and its rejection/expiry paths run the mark
+  cleanup.
 
 ### 2. Worktree workpiece (workshop-backend + workshop-shared)
 
@@ -412,7 +523,10 @@ agent-facing `Worktree` binding API).
     enumeration.
   - `GitHubPullRequest.listCommits() → Cursor<CommitSummary>`.
   - Stamp `gitCommits` on existing SHA-bearing observations too (`readDiff`'s
-    base/head SHAs, `getDetails` branch refs).
+    base/head SHAs, `getDetails` branch refs). Stamps are pull-routing hints
+    only; a gatekeeper *may* also `put()` a commit's bytes alongside an
+    observation to upgrade the hint to `onRemote` proof (§1) — not needed for
+    the v1 flows, where worktree creation pulls the base.
   - Observer verification: unchanged — strategy B's repo ACL covers git data.
 - **`gitPull(oids, cache, hints)`** on the gatekeeper DO (`GitHubGatekeeperImpl`):
   - Smart-HTTP protocol v2 `fetch` against `https://github.com/{o}/{r}.git`
@@ -430,31 +544,38 @@ agent-facing `Worktree` binding API).
     (partial-clone lazy fetch — this is exactly what git itself does against
     GitHub).
 - **Push** — queued action `push(branch, commitId, {force?})`:
-  - Queue: validates `commitId` exists in the `GitCache`; description names repo,
+  - Queue: the `ActionDescription` declares `pushedCommits: [commitId]`, and the
+    overseer's `submitAction` verification + marking (§1) *is* the validation —
+    an unrelated commit, a missing ancestor, or an unproven root fails right
+    there, agent-visible, before anything is queued. Description names repo,
     branch, commit, force-ness. Simulation overlays the pending push onto
-    `listBranches`/`getCommit` reads per the write-gatekeeper simulation convention.
-  - Apply: walk the object graph starting at `commitId`, reading from the
-    `GitCache` stub passed to `applyAction()` (approval can happen hours after the
-    session that queued the action, so the cache must arrive with the apply call —
-    §1/§4), stopping early at objects the remote is known to have (remembered tips
-    / the branch's current sha). **Missing objects are expected, not errors**:
-    pulls are shallow and filtered, so a rebuilt tree routinely references blobs
-    that were never fetched. Each miss goes through `GitCache.ensure(oid, {type,
-    referencedBy})` (the walker knows every reference's type from the referencing
-    object): an `"origin"` answer means this gatekeeper is the object's
-    recorded source — it is missing precisely because we skipped pulling it from
-    this very repo — so the remote already has it and the walker excludes it from
-    the pack (the common case); `"present"` means the overseer pulled it from a
-    *different* gatekeeper's provenance and the walker includes it (the
-    pull-from-A-push-to-B case). An oversized blob is fine in the origin case
-    (excluded like any other) but fails a cross-origin push with a clear error —
-    accepted for now, oversized-blob handling is punted. Then: build an
-    undeltified pack (isomorphic-git `packObjects` or equivalent over the raw
-    objects); send-pack to receive-pack with the ref-update command (`old-sha
-    new-sha refs/heads/branch`, zero-id old-sha creates the branch; non-force
-    update requires old-sha match — a stale old-sha fails apply with a clear
-    error). Record `previousSha` as revert info; revert = ref rollback (or delete,
-    if the push created the branch).
+    `listBranches`/`getCommit` reads per the write-gatekeeper simulation
+    convention, reading pending commits via `GitCache.get()` — which serves
+    (pulling through if needed) exactly what is queued for push to this remote,
+    to be treated as already pushed.
+  - Apply: **no gatekeeper-side object walk at all** — call `buildPack()` on the
+    action-scoped `GitCache` stub passed to `applyAction()` (approval can happen
+    hours after the session that queued the action, so the cache must arrive
+    with the apply call — §1/§4) and stream the pack into a send-pack request
+    with the ref-update command (`old-sha new-sha refs/heads/branch`, zero-id
+    old-sha creates the branch; non-force update requires old-sha match — a
+    stale old-sha fails apply with a clear error). The overseer composes the
+    pack from the action's pending-push marks, faulting in any absent marked
+    objects from their recorded sources — that is the cross-remote
+    (pull-from-A-push-to-B) case, batched; a push back to the origin costs
+    nothing extra, since the marking walk already excluded everything the remote
+    has. An oversized blob in the closure fails a cross-remote push with a clear
+    error when the pull-through hits `put()`'s size rejection — accepted for
+    now (a same-origin push never meets one: it's remote-known and excluded).
+    **Apply is idempotent** (the §4 `applyAction` contract): before sending, the
+    DO durably records a per-action intent `{branch, oldSha, newSha}` (it reads
+    the branch head to compose old-sha anyway); a retried apply that finds the
+    intent recorded and the remote branch already at `newSha` reports success
+    instead of failing on a stale old-sha, with `previousSha = intent.oldSha` —
+    so revert metadata survives the crash window between GitHub accepting the
+    push and the overseer persisting the completion. Record `previousSha` as
+    revert info; revert = ref rollback (or delete, if the push created the
+    branch); the pushed objects stay `onRemote` (§1).
   - "Create a PR from a commit" = `push` to a branch + the existing
     `createPullRequest` (document the flow in types.d.ts; add a convenience only if
     it earns its keep).
@@ -462,13 +583,28 @@ agent-facing `Worktree` binding API).
 ### 4. Shared API finalization (workshop-shared)
 
 - The `gatekeeper.ts` types from 2500f71 land essentially as sketched, with:
-  - `GitCache.put()` doc-noting that callers may (should) issue many puts in
-    parallel; no batch method (the stub is facet-to-parent, always local).
-  - `GitCache.ensure(oid, {type, referencedBy})` replacing the sketch's `pull()`
-    TODO (§1 — the push walker's missing-object resolution, with its
-    type-specific exact-object pull hints).
+  - `GitCache` finalized as `get(oid, hints?)` / `has` / `stat` / `put` /
+    `buildPack()` (§1); the sketch's `pull()` TODO resolves by *deletion* —
+    gatekeepers never trigger pulls. Doc-comment the scoped view
+    (`onRemote ∪ pendingPush`, null otherwise, uniformly across
+    `get`/`has`/`stat`), the simulation contract (a pending commit reads as
+    already pushed), `buildPack()`'s zero-argument, apply-time-only nature (the
+    action-scoped stub supplies the commit list and closure), and the
+    parallel-`put` note (no batch method; the stub is facet-to-parent, always
+    local).
+  - `ActionDescription.pushedCommits?: GitOid[]` — the push declaration
+    `submitAction` verifies and marks (§1). Doc-comment the symmetry:
+    observations *advertise* commits (`gitCommits` — unproven pull-routing
+    hints), actions *declare* pushes (`pushedCommits` — ancestry-checked as a
+    mistake-safeguard, and the source of the pending-push view that simulation
+    reads).
   - `Gatekeeper.applyAction()` gains a `GitCache` parameter (§1 — the queue-time
-    stub is unavailable at apply time).
+    stub is unavailable at apply time; the apply-time stub is action-scoped and
+    carries `buildPack`). Its doc-comment also gains the general contract that
+    the overseer may deliver the same apply more than once (crash/retry), so
+    implementations must be idempotent — formalizing what crash recovery always
+    implied. The new push action honors it (§3); auditing existing gatekeepers'
+    actions for it is explicitly out of scope here.
   - `GitPullHints.commitHistory` stays **required** — a default would have to be
     either "full" (which we never intend to request) or an arbitrary depth; better
     to make every caller say what it means.
@@ -513,8 +649,9 @@ agent-facing `Worktree` binding API).
 1. **GitHub upload-pack capabilities** against a live repo: protocol v2 fetch with
    SHA `want`s for commits *and* blobs, `shallow` combined with `filter`,
    `blob:limit` and `tree:<depth>` support — including the exact-object mappings
-   `ensure()` depends on (`tree:0` alongside a commit want; `tree:1` + no-blobs
-   alongside a tree want). (Partial-clone lazy fetch implies blob
+   the pull-through defaults depend on (`tree:0` alongside a commit want — also
+   the "pull a shared ancestor commit alone" flow; `tree:1` + no-blobs alongside
+   a tree want). (Partial-clone lazy fetch implies blob
    wants work; verify rather than assume — the repo's own AGENTS.md pattern.)
    Include: does `filter blob:limit` suppress **explicitly wanted** blobs? This
    decides the oversized-blob fault path — either the wanted blob never arrives
@@ -530,7 +667,34 @@ agent-facing `Worktree` binding API).
 
 - **Provenance loss**: a disconnected/deleted gatekeeper record makes its objects
   unpullable. No eviction in v1 means already-pulled objects keep working; only
-  *new* faults fail, with an actionable error.
+  *new* faults fail, with an actionable error — including a `get()`/`buildPack()`
+  pull-through mid-simulation or mid-apply ("reconnect X").
+- **Trust model: oids are capabilities, and gatekeepers are trusted with them.**
+  The scoped cache view is a mistake-safeguard and a simulation aid, **not a
+  confinement boundary** — don't document it as one. Assume a gatekeeper can
+  read any object whose oid it knows: for a tree/blob it can fabricate a commit
+  naming the oid, parent the fabrication on an `onRemote` commit of its own,
+  and declare it in `pushedCommits`; and the shared-ancestry rule is not
+  security-grade either — obtaining the *content* of any one commit in a
+  history (a root commit may even be guessable) and `put()`ing it makes
+  everything chaining onto it pushable to, and hence readable by, that
+  gatekeeper. This is consistent with the existing trust model: gatekeepers
+  already implement their own pre-approval simulation, and nothing stops one
+  from skipping the approval flow entirely — users must not connect a
+  gatekeeper they don't trust to a workspace holding sensitive data. Least
+  authority still applies (don't widen the view casually), but don't contort
+  the implementation chasing stronger properties here, or claim guarantees
+  stronger than these.
+- **Submodules (gitlink entries) are inert everywhere**: the lazy walker and
+  `listFiles` surface them as unsupported entries and never walk through them,
+  the marking walk skips them (§1 — following one would mark a foreign repo's
+  commit), and pushes never include them. Consistent with the text-only scope.
+- **Local-root histories are unpushable by design**: a worktree created from a
+  purely local commit (gadget history, another worktree) fails ancestry
+  verification against every gatekeeper — nothing in its history is proven on
+  any remote, and root commits get no vacuous pass. The queue-time error should
+  say so plainly; exporting local work to a fresh repo is the punted,
+  explicitly-human flow.
 - **Prefix resolution** in `createWorktree` is against *local knowledge only*
   (`gitObjects` ∪ `gitObjectMetadata`) — never a remote lookup. Remote
   truncated-id resolution is `getCommit(ref)` on the gatekeeper, which returns
@@ -615,26 +779,41 @@ Ordered so kernel diffs are isolated and reviewable apart from the gatekeeper wo
 to be decided later.
 
 1. **shared: git cache API** (workshop-shared) — finalize changes from 2500f71:
-   `gatekeeper.ts` additions (`GitCache` with the parallel-`put` doc note and
-   `ensure()`, `GitPullHints` with `commitHistory` required, `Gatekeeper.gitPull`,
+   `gatekeeper.ts` additions (`GitCache` as scoped `get(oid, hints?)`/`has`/
+   `stat`/`put`/`buildPack` with the parallel-`put` doc note and the simulation
+   contract, `GitPullHints` with `commitHistory` required, `Gatekeeper.gitPull`,
    the `GitCache` parameter on `Gatekeeper.applyAction`,
-   `ObservationAuthorizer.getGitCache`, `ObservationDescription.gitCommits`), fully
-   doc-commented. No implementation yet; overseer gains a stub `getGitCache` so the
-   tree compiles.
-2. **backend: git cache + provenance + pull driver** — `GitCacheImpl` (incl.
-   `ensure()` and the per-gatekeeper stub minting it depends on),
-   `gitObjectMetadata` collection (type/size/gatekeeperIds), metadata recording at
-   `authorizeObservation` and `put()`, `ensureGitObjects` pull driver, the lazy
-   walker (`ensureObject`, hand-rolled tree/commit parsers over the shared raw
-   codec), passing the cache to `applyAction`, git-store extensions
-   (`readFileAtCommit`, `listTreeEntries`, `writeChangedFilesAsCommit` with
-   separate treeBase/parents, raw object helpers). Workerd tests: cache
-   round-trips vs known-good git hashes, poison rejection, metadata at all three
-   write points, fault-pull-retry with a mock gatekeeper, `ensure()`'s
-   origin-vs-present-vs-foreign-pull matrix (asserting the mock gatekeeper
-   receives the type-specific exact-object hints), walker output cross-verified
-   against isomorphic-git over the same store, changed-files commits reusing
-   subtree oids.
+   `ActionDescription.pushedCommits`, `ObservationAuthorizer.getGitCache`,
+   `ObservationDescription.gitCommits`), fully doc-commented. No implementation
+   yet; overseer gains a stub `getGitCache` so the tree compiles.
+2. **backend: git cache + provenance + push authorization** — `GitCacheImpl`
+   (per-gatekeeper stub minting; scoped `get`/`has`/`stat` incl. pending-push
+   pull-through with hints; `put()` with proof-of-possession recording;
+   `buildPack` over a new undeltified pack writer), `gitObjectMetadata`
+   (type/size/`onRemote`/`pullableFrom`/`pendingPush`) + the `pushMarks` action
+   index, metadata recording at `authorizeObservation` and `put()` (incl.
+   tree/commit referent rows), `submitAction` ancestry verification + marking
+   walk + lazy propagation + mark lifecycle (apply-converts / reject-cleans /
+   revert-keeps), `ensureGitObjects` pull driver, the lazy walker
+   (`ensureObject`, hand-rolled tree/commit parsers over the shared raw codec),
+   passing the cache to `applyAction`, git-store extensions (`readFileAtCommit`,
+   `listTreeEntries`, `writeChangedFilesAsCommit` with separate
+   treeBase/parents, raw object helpers). Workerd tests: cache round-trips vs
+   known-good git hashes, poison rejection, metadata at every write point,
+   fault-pull-retry with a mock gatekeeper, ancestry verification (proven-base
+   pass; absent-ancestor error; root-commit rejection; advertisement alone
+   rejected while observation-time `put()` passes), marking-walk matrix
+   (remote-known skipped without descent, gitlinks skipped, absent objects
+   marked + lazy propagation at `put()`), the `get()`/`has()`/`stat()` view
+   matrix (onRemote / pendingPush / other × present / absent, pull-through
+   receiving the hints), mark lifecycle
+   across apply/reject/revert and a crash between push and conversion,
+   `buildPack` completing the closure (absent marked tree faulted → children
+   marked and faulted in turn, batched per source; action-scoped stub required,
+   session stub throws) with output verified by real `git index-pack` fixtures,
+   walker output
+   cross-verified against isomorphic-git over the same store, changed-files
+   commits reusing subtree oids.
 3. **backend: worktree records + createWorktree + file tools** — `GadgetRecord` →
    `WorkpieceRecord` (`type` discriminator, optional `bindingName`, null-index
    opt-out) with the full consumer audit (`subscribeToWorkpieces`,
@@ -686,13 +865,18 @@ to be decided later.
    Tests: pkt-line round-trips, pack fixtures produced by real git (incl. delta
    objects), hint mapping, tips-based have construction. (Spikes 1–2 land before or
    with this commit.)
-7. **github: push + PR-from-commit** — `push` action (queue/simulate/apply/revert),
-   object-graph walk over the apply-time cache with known-remote cutoff and
-   `ensure()`-based missing-object resolution, pack building, send-pack;
-   types.d.ts flow docs for push + createPullRequest. Tests: walk cutoff,
-   missing-object matrix (same-origin skip; cross-remote pull-through include;
-   oversized cross-origin failure), ref-update encoding, force/non-force, revert
-   to `previousSha`, branch-creation push.
+7. **github: push + PR-from-commit** — `push` action (queue/simulate/apply/
+   revert): `pushedCommits` declaration, simulation overlay reading pending
+   commits via `get()`, apply = `buildPack` stream → send-pack framing +
+   ref-update command; types.d.ts flow docs for push + createPullRequest.
+   Tests: queue-time rejection surfaces to the agent (unrelated commit, missing
+   ancestry, unproven root), simulation reads pending commits as pushed,
+   ref-update encoding, force/non-force, stale old-sha failure, idempotent
+   re-apply (intent recorded, remote already at `newSha` → success with the
+   original `previousSha`), revert to `previousSha`, branch-creation push,
+   cross-remote push end-to-end against two mock remotes (pull shared ancestor
+   from B → push A-derived commits to B, absent filtered blobs pulled through
+   during `buildPack`; oversized cross-remote failure).
 
 ## Punted / future work (deliberately kept open)
 
@@ -701,13 +885,23 @@ to be decided later.
 - Eviction/GC — `gitObjectMetadata` is the re-pull index; the GC-roots enumeration
   in git-store.ts gains "worktree `headCommit`/`pinBase`/`baseCommit`" when it
   happens.
-- Binary and >1MB file editing; `putStream()` for large blobs; cross-origin push
-  of trees referencing oversized blobs (fails with a clear error until then —
-  same-origin pushes are unaffected).
+- Binary and >1MB file editing; `putStream()` for large blobs; cross-remote push
+  of trees referencing oversized blobs (the apply-time pull-through hits
+  `put()`'s size rejection and fails with a clear error until then — same-origin
+  pushes are unaffected, the marking walk excludes them as remote-known).
+- Repo initialization / exporting local-root histories to a fresh remote — an
+  explicit, human-initiated (likely UI-mediated) act, deliberately unavailable to
+  agents and gatekeepers (root commits get no vacuous ancestry pass; see the
+  watch-fors).
+- `buildPack` internals: deltified/thin packs, and streaming a source
+  gatekeeper's pack straight through to the destination without staging every
+  object in the cache.
 - Cross-chat / workspace-scoped worktrees; user editing of worktrees.
 - `merge` / `reset` on the Worktree API.
 - Unifying `GatekeeperRecord` into the workpiece table.
 - Diff-based `writeFile` for the gadget writeFile agent tool (same helper).
 - Deep-history pulls (`commitHistory: full/since` are specified but GitHub-side
-  usage ships shallow-only defaults).
+  usage ships shallow-only defaults) — also the missing piece for cross-remote
+  pushes of *pre-existing* diverged branches (§1's ancestry-verification bound:
+  the head-to-ancestor commit chain must be cached).
 - Other git hosts (the gatekeeper interface is host-neutral by construction).
