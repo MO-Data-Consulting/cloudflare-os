@@ -9926,6 +9926,11 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // actions that this newly unblocks. Auto-approval rules are workspace-wide per gatekeeper.
   async setAutoApprovedActionKind(gatekeeperId: WorkpieceId, actionKind: ActionKind)
       : Promise<void> {
+    // Fetch the approver's profile before the gates below: awaiting between them and the put
+    // would let a concurrent restricted observation latch the workspace and still persist an
+    // inert rule (or a concurrent removeGatekeeper slip past the existence check).
+    let profile = await this.#getClientProfile();
+
     let gatekeeper = this.impl.storage.gatekeepers.get(gatekeeperId);
     if (!gatekeeper) {
       throw new Error(`No such gatekeeper: ${gatekeeperId}`);
@@ -9939,7 +9944,6 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
           "approval and cannot be auto-approved.");
     }
 
-    let profile = await this.#getClientProfile();
     this.impl.storage.autoApproveTags.put({
       gatekeeperId,
       actionKind,
