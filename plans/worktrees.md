@@ -53,9 +53,12 @@ agent-facing `Worktree` binding API).
 - **Edits ride the existing chat OT stream.** `CodeChange` is already keyed by
   `WorkpieceId` and pins are `{gadgetId, baseCommit}`; a worktree is *born pinned* at
   its base commit, so readFile/writeFile/editFile, the read-before-edit gate,
-  `chatChanges` rows, replay, and compaction all work unchanged. (The alternative — a
-  worktree-local overlay — was rejected: agent replay needs content-at-each-point
-  history, which is most of the OT stream rebuilt.)
+  `chatChanges` rows, replay, and compaction all work unchanged. Agent-authored rows
+  are born at the step persistence barrier per plans/step-transactionality.md — a
+  prerequisite of this plan — so worktree edits and `commit()` head advancements
+  inherit its transactional crash semantics. (The alternative — a worktree-local
+  overlay — was rejected: agent replay needs content-at-each-point history, which is
+  most of the OT stream rebuilt.)
 - **One workpiece table.** Worktrees are stored in the existing `gadgets` collection,
   which generalizes: `GadgetRecord` becomes a `WorkpieceRecord` with a `type`
   discriminator. This avoids a second lookup to resolve what a `WorkpieceId` refers
@@ -162,6 +165,11 @@ agent-facing `Worktree` binding API).
   (`CodeChange` keyed by `WorkpieceId`), lazy pins `{gadgetId, baseCommit}` +
   `mergedCommit`, epochs bounded by `mergeChanges`' reset, `buildChatContent` folding
   the log, agent session content as `Map<WorkpieceId, Map<path, string>>`.
+- Step barrier (post step-transactionality.md, this plan's prerequisite): agent
+  tool effects buffer in memory per model step and persist transactionally with
+  the step's tool-call message at the `turn_end` barrier — agent rows are born
+  and retired in one storage transaction, live `chatChanges` rows are
+  user-authored only, and a mid-step crash leaves no durable trace of the step.
 - Workpiece dispatch seams (the four places that know gadget-vs-gatekeeper):
   `resolveWorkpieceRoot`, `getEnvForAgent`/`makeBindingLoopback`, `describeBinding`,
   and the pinned/unpinned split in the agent file tools.
@@ -399,9 +407,9 @@ agent-facing `Worktree` binding API).
   listing candidates; unknown → "look it up via the gatekeeper first"). There is no
   requirement that the commit came from a gatekeeper: any locally-present commit
   works (a gadget's history, another worktree's commit) and needs no provenance,
-  since local-origin objects never fault. Then: flush barrier; create the record;
-  add the chat binding; record `{worktreeId, changeId}` as the tool output so replay
-  never re-creates. For gatekeeper-known commits, creation performs the **initial
+  since local-origin objects never fault. Then: create the record (pending, like
+  `createGadget` — stamped at the step barrier); add the chat binding; record
+  `{worktreeId, changeId}` as the tool output so replay never re-creates. For gatekeeper-known commits, creation performs the **initial
   pull**: `gitPull([commit], cache, {type: "commit", commitHistory: {kind: "depth",
   depth: 1}, filterBlobSize: EAGER_BLOB_LIMIT})` — one fetch for commit + all trees
   + small blobs.
@@ -459,9 +467,9 @@ agent-facing `Worktree` binding API).
     blob size, and a filtered pull leaves omitted blobs' sizes unknown until
     fetched, so sizes would force fetching every blob).
   - `readFile(path) → string`, `writeFile(path, text)`, `deleteFile(path)` — text
-    oriented; writes/deletes are OT rows exactly like the file tools' (they go
-    through the same append hook, so replay and the UI-someday subscription see
-    them). **`writeFile` on an existing, readable file diffs**: the OT row is a
+    oriented; writes/deletes are OT rows exactly like the file tools' (they join
+    the same step buffer and land through the same barrier, so replay and the
+    UI-someday subscription see them). **`writeFile` on an existing, readable file diffs**: the OT row is a
     minimal edit computed via `diffFiles` (fast-diff) against current content, not
     a whole-file `set` — keeping rows and composed changes bounded by changed
     regions. `set` is used only for new files and for bases we can't read
@@ -485,24 +493,19 @@ agent-facing `Worktree` binding API).
     all untouched, so the rows remain the single record of the overlay and replay
     cannot double-apply it. Right after a commit the content is unchanged and
     `diff()` is empty — exactly git's own behavior after `git commit`. Head
-    advancements are made durable **at `commit()` time, not at flush**: the same
-    durable step that advances the record's `headCommit` (so later calls in the
-    same execution see the new head) appends an *unstamped* advancement record
-    `{id, worktreeId, newHead, previousHead, chatId}` to a small
-    `worktreeHeadLog` collection. When the enclosing `executeCode` call's own
-    record persists, it carries the advancement ids as a **system-recorded field
-    on the `AiToolCall`** (like `readFile`'s `observedCommit` stamps — never the
-    caller-visible output, which is arbitrary text that need not contain any
-    oid): the vouching link that lets crash reconciliation tell a recoverable
-    advancement from an orphaned one (edge case below). The next flush copies
-    the turn's advancements onto the `"changes"` message as `worktreeCommits`
-    (§4) and stamps/deletes the log records — from then on the message is the
-    durable, sequence-bearing record that revert/abort rollback keys on. This is
-    the pending-gadget stamping-and-vouching pattern end to end. Commit identity
-    comes from the chat owner
+    advancements **ride the step buffer** (plans/step-transactionality.md, a
+    prerequisite of this plan): `commit()` writes the git objects eagerly
+    (content-addressed and idempotent — a crash orphans them harmlessly) but
+    advances only the in-memory head, which later calls in the same execution
+    read. The step's persistence barrier then, in the same storage transaction
+    that persists the enclosing `executeCode` call's record, advances the
+    record's `headCommit` and records the advancements as `worktreeCommits` on
+    the step's `"changes"` message (§4) — the durable, sequence-bearing record that revert
+    rollback keys on. An advancement is therefore durable iff the call that made
+    it is in the transcript: no staging collection, no vouching, and no crash
+    window between them. Commit identity comes from the chat owner
     (`commitIdentityForAuthor`). Replay is safe: executeCode results are
-    recorded, so the call never re-executes on replay, and the object writes are
-    content-addressed and idempotent.
+    recorded, so the call never re-executes on replay.
   - `diff(commitId?) → string` — unified diff of current content vs. the given
     commit (default `headCommit`). Needs a small git-style unified-diff formatter
     (new utility; we have diff engines but no printer). `commitId` may be any local
@@ -622,11 +625,9 @@ agent-facing `Worktree` binding API).
     the frontend never renders a worktree as a gadget creation;
   - `worktreeCommits` on `"changes"` messages — `{worktreeId, commit,
     previousHead}[]`, the durable record of explicit `commit()` head advancements
-    (flushed like `createdGadgets`; the revert/abort rollback anchor — see the
-    edge case);
-  - a system-recorded advancement-id list on the `executeCode` `AiToolCall`
-    variant — the crash-reconciliation vouching link (§2); a recorded detail like
-    `readFile.observedCommit`, not caller-visible output;
+    (recorded at the step barrier on the step's single `"changes"` message, like
+    `createdGadgets` — a step's extras and edits revert together; the revert
+    rollback anchor — see the edge case);
   - `worktreePins` on `"merge"` messages — the epoch re-pins (§2), the durable
     record `buildChatContent` and compaction checkpoints re-establish worktree
     bases from.
@@ -714,39 +715,29 @@ agent-facing `Worktree` binding API).
   worktree ids (it should — ids are opaque).
 - **Chat deletion**: delete worktree records + chat bindings; objects stay (no GC,
   dangling is fine and consistent with gadget history behavior).
-- **Turn abort / revert vs. `commit()`**: worktree OT rows are erased like any
-  others (generation bump), and since pins and `pinBase` change only at epoch
-  boundaries, row erasure never strands them. `headCommit` is the one piece of
-  record state a turn can advance — and a `commit()` happens *inside*
+- **Turn abort / revert vs. `commit()`**: a `commit()` happens *inside*
   `executeCode`, with no log event of its own, while reverts mark messages, not
-  calls. That is exactly why advancements ride the flush message's
+  calls. That is why advancements ride the step's `"changes"` message's
   `worktreeCommits` field (§2/§4): the durable record has a chat sequence, like
-  pending creations and binding additions, and the lifecycle rules mirror theirs:
+  pending creations and binding additions. With the step barrier
+  (plans/step-transactionality.md) the lifecycle is short:
   - **Revert**: a revert covering a `worktreeCommits`-bearing message rolls each
     affected worktree's `headCommit` back to the earliest reverted advancement's
     `previousHead` (entries are ordered within a message and messages by
-    sequence, so multiple commits per turn or per reverted range compose).
-  - **Turn abort**: discards the turn's unflushed effects; the turn's unstamped
-    `worktreeHeadLog` records roll back the same way, to the pre-turn head.
-  - **Crash before flush** — two distinct windows, distinguished by the vouching
-    field (§2), i.e. by whether the enclosing `executeCode` call's record
-    persisted. *After* it persisted: replay of that call re-adopts its vouched
-    unstamped advancements, and the next flush stamps them. *Before* it
-    persisted: the call is lost from the transcript and the resumed turn will
-    re-run the step — so reconciliation (at turn start, before any re-run) rolls
-    unvouched unstamped records back, and the re-run's `commit()` starts from
-    the restored head instead of parenting on an orphan the transcript never
-    saw. An unstamped record survives iff a persisted call references its id —
-    `reconcilePendingGadgets`' vouching rule verbatim, and per-call ids also
-    handle multiple `executeCode` calls per turn. Rollback is in reverse
-    insertion order, landing on the earliest reaped record's `previousHead`; a
-    turn that never resumes reconciles identically.
+    sequence, so multiple commits per step or per reverted range compose).
+  - **Turn abort / crash mid-step**: the in-flight step's buffer — edits and
+    head advancements alike — simply evaporates; nothing durable exists until
+    the barrier. Completed steps' advancements are ordinary message-recorded
+    state that abort deliberately keeps (abort stops the agent, it does not
+    revert; the user reverts explicitly if they want the work gone).
   - **Accept/merge**: cannot run mid-turn (turns hold the chat), so it never
-    observes an unflushed advancement.
+    observes a mid-step advancement.
   The commit objects themselves always remain — dangling and harmless, like
   auto-commits; a queued push referencing a rolled-back commit's oid stays valid,
-  since the object is real. Test: abort after a mid-turn commit; a user revert
-  spanning a turn that committed twice; crash-resume between commit and flush.
+  since the object is real. Test: abort after a mid-step commit (buffer dropped,
+  `headCommit` unchanged); a user revert spanning a step that committed twice;
+  crash-resume mid-step (no durable trace; the re-run's `commit()` parents on
+  the unchanged head).
 - **Delivery filtering must cover every client path**: live `changeApplied` events,
   subscribe-replay of retained rows, message delivery (`"changes"`/`"merge"`
   payloads and pins), and chat metadata (`codeBase` pins). Miss one and the
@@ -778,6 +769,11 @@ Ordered so kernel diffs are isolated and reviewable apart from the gatekeeper wo
 (AGENTS.md kernel bar); each commit builds/tests green unless noted. PR boundaries
 to be decided later.
 
+0. **Prerequisite: the step-transactionality refactor**
+   (plans/step-transactionality.md) lands first, as its own PR — it fixes a live
+   crash bug independently of worktrees, and commits 3–4 assume the per-step
+   buffer and transactional barrier it introduces (worktree edits and `commit()`
+   head advancements have no crash machinery of their own).
 1. **shared: git cache API** (workshop-shared) — finalize changes from 2500f71:
    `gatekeeper.ts` additions (`GitCache` as scoped `get(oid, hints?)`/`has`/
    `stat`/`put`/`buildPack` with the parallel-`put` doc note and the simulation
@@ -837,24 +833,22 @@ to be decided later.
    `mergeChanges` reset (`worktreePins` on the merge message, headCommit reuse
    when trees match, squash semantics), the `Worktree` RpcTarget (listFiles/
    readFile/writeFile/deleteFile/grep/structuredGrep/commit/diff, with
-   diff-based `writeFile`), durable-at-commit `worktreeHeadLog` advancement
-   records (vouched by the system-recorded field on the persisted executeCode
-   call) + `worktreeCommits` flush stamping + the revert/abort/crash rollback
-   and reconciliation rules, unified-diff formatter, `describeBinding`
-   text, finalized `worktree.d.ts`. Tests: accept with dirty worktree preserves
+   diff-based `writeFile`), buffered `commit()` head advancements landing as
+   `worktreeCommits` on the step barrier's `"changes"` message (in-memory until
+   the barrier; §2) + the revert rollback rules, unified-diff formatter,
+   `describeBinding` text, finalized `worktree.d.ts`. Tests: accept with dirty
+   worktree preserves
    content and squashes (explicit commit parents on last explicit head after N
    accepts, tree built from pinBase + overlay only), commit() leaves pins/rows
    untouched (no double-apply on replay; empty diff right after), boundary re-pin
    replay from `worktreePins` (incl. across a compaction checkpoint), commit
    determinism, `writeFile` emits minimal edits (and `set` for new/unreadable
    files), diff output goldens, grep batch-fill (one pull for a directory of
-   missing blobs), abort-after-mid-turn-commit and revert-across-two-commits head
-   rollback, crash-resume with the executeCode call persisted (vouched
-   advancement re-adopted and stamped by the next flush), crash-resume with the
-   call unpersisted (unvouched advancement rolled back at turn start; the
-   re-run's commit parents on the restored head), multiple executeCode calls per
-   turn with a mix of vouched/unvouched advancements, dead-turn reconciliation
-   (unstamped advancements reaped, head rolled back in reverse order).
+   missing blobs), abort-after-mid-step-commit (buffer dropped, head unchanged)
+   and revert-across-two-commits head rollback, crash-resume mid-step (no
+   durable trace; the re-run's commit parents on the unchanged head), multiple
+   executeCode calls per turn each advancing the head across separate barriers,
+   multiple commits within one step (advancements ordered within the message).
 5. **github: session git reads** — `listBranches`/`listTags`/`getCommit`/
    `listCommits`/PR `listCommits`, `gitCommits` stamping (new + existing SHA-bearing
    observations), types.d.ts docs. Pure REST; no protocol code yet. Tests extend
