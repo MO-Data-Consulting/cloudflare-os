@@ -6886,8 +6886,13 @@ function ChatInterface({
     // description in both presentations. Their presence also suppresses the always-approve
     // affordance below (the backend never auto-approves a warned action regardless).
     const operatorWarnings = log.description.operatorWarnings ?? [];
+    // Referenced by the approve/deny buttons' aria-describedby: the inline pending row renders
+    // the warnings below the controls, so screen readers wouldn't otherwise reach them before a
+    // decision. Deterministic (not useId -- this is a closure, not a component), keyed by the
+    // action id, which is unique within the page.
+    const warningsId = operatorWarnings.length > 0 ? `action-warnings-${msg.actionId}` : undefined;
     const warningStrip = operatorWarnings.length > 0 ? (
-      <div className="mt-1 space-y-1">
+      <div id={warningsId} className="mt-1 space-y-1">
         {operatorWarnings.map((warning, i) => (
           <div
             key={i}
@@ -6945,12 +6950,14 @@ function ChatInterface({
           tone="deny"
           onClick={() => void resolveAction(msg.actionId, "deny")}
           disabled={isProc}
+          describedBy={warningsId}
         />
         <ResolveButton
           tone="approve"
           variant={isBlocking ? "filled" : "quiet"}
           onClick={() => void resolveAction(msg.actionId, "approve")}
           disabled={isProc}
+          describedBy={warningsId}
         />
       </>
     ) : null;
