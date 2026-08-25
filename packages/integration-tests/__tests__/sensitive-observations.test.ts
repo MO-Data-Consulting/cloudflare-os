@@ -168,6 +168,42 @@ describe("sensitive observations", () => {
     });
   });
 
+  it.concurrent("a pre-latch pending action on another connection cannot be approved after " +
+      "the latch", async () => {
+    await withSession(async publicApi => {
+      const ws = await newWorkspace(publicApi, "approve-after-latch");
+
+      // A second connection queues an action while the workspace is still unlatched, so
+      // submitAction's carve-out check admits it and it pends for manual approval.
+      const accounts = await listConnectedAccounts(ws.aliceApi);
+      const account = accounts.find(a => a.vendorId === TEST_VENDOR_ID)!;
+      const other = await ws.overseer.newGatekeeper(
+          account.id, thingUrl("approve-after-latch-other"));
+      if (!other) throw new Error("Failed to create the second test connection");
+      const otherGatekeeperId = await other.getId();
+      const otherSession: any = await other.openSession();
+      await expect(otherSession.doThing()).resolves.toBeUndefined();
+
+      // The first connection latches the workspace. The second connection is not a producer, so
+      // its still-pending action now violates the writes-to-self carve-out.
+      await expect(ws.session.readThing(true)).resolves.toContain("approve-after-latch");
+
+      const { entries } = await ws.overseer.listActions();
+      const pending = entries.find(
+          a => a.type === "action" && a.state === "pending" &&
+               a.gatekeeperId === otherGatekeeperId);
+      if (!pending) throw new Error("The pre-latch action is not pending");
+
+      // Approval is refused at the apply chokepoint; the action stays pending, and denying it --
+      // the way to unstick a suspended agent turn -- still works.
+      await expect(ws.overseer.approveAction(pending.id))
+          .rejects.toThrow(/only perform actions on those same connections/i);
+      await expect(ws.overseer.rejectAction(pending.id)).resolves.toBeUndefined();
+      const after = await ws.overseer.listActions();
+      expect(after.entries.find(a => a.id === pending.id)?.state).toBe("rejected");
+    });
+  });
+
   it.concurrent("an unredeemed share link does not block a sensitive observation", async () => {
     await withSession(async publicApi => {
       const ws = await newWorkspace(publicApi, "unredeemed");
