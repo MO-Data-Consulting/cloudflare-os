@@ -6296,6 +6296,13 @@ function ChatInterface({
       actionKind: ActionKind; actionLabel: string } | null
   >(null);
 
+  // Dismiss an open confirmation when the workspace latches restricted mode: the affordance that
+  // opened it is already suppressed, and confirming could only error (setAutoApprovedActionKind
+  // refuses while restricted).
+  useEffect(() => {
+    if (restricted) setAutoApproveConfirm(null);
+  }, [restricted]);
+
   // Enable auto-approval of an action tag on its connection (gated by the confirm dialog). The
   // server applies the now-eligible pending action(s) via its drain, and the action state flips to
   // "approved" through the actions subscription -- so we don't optimistically mutate it here.
