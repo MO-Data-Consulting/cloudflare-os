@@ -156,6 +156,27 @@ agent-facing `Worktree` binding API).
   binary blobs like oversized ones (clean error on read, skipped by grep). Blob bytes
   still land in the cache unmodified, so push round-trips binaries that came from a
   pull untouched.
+- **All five tree-entry modes are parsed; only regular files are operable;
+  existing modes are preserved.** A real repo's trees contain `100644`,
+  `100755` (executable), `040000`, `120000` (symlink), and `160000` (gitlink),
+  so every tree-reading path (lazy walker, `listFiles`, marking walk) handles
+  all five — unlike today's gadget-only paths, which reject what they never
+  write (`readCommitFiles`) and write `100644` unconditionally
+  (`#writeTreeNode`; that gadget path stays as-is). Operable content is
+  regular files of *either* mode: editing an executable preserves its
+  `100755` — `writeChangedFilesAsCommit` carries the base entry's mode into
+  the rebuilt tree, and only genuinely *new* files default to `100644`. No
+  API creates an executable or changes a mode for now (future work). Symlinks
+  and gitlinks are **inert, and touching one throws**: `listFiles` surfaces
+  them with their kind, but readFile/writeFile/editFile/deleteFile on such a
+  path throws a descriptive error — for a symlink, `"<path> is a symlink to
+  <target>"` (the target *is* the blob's content, so the message tells the
+  agent everything it needs); for a gitlink, `"<path> is a submodule
+  (gitlink) pointing at commit <oid>"` — and grep skips them with a note,
+  like binaries. Untouched entries of every kind ride through commits
+  unchanged (tree rebuilds copy mode + oid verbatim), and symlink blobs
+  travel in push closures like any blob; gitlink target *commits* are still
+  never pulled, walked, or pushed (§1).
 - **Lazy reads are a hand-rolled walker, not isomorphic-git.** The new
   read-on-demand paths (per-path tree walk, entry listing, commit header reads) parse
   git objects themselves and call `ensureObject(oid, {type, referencedBy})` before
@@ -381,6 +402,10 @@ agent-facing `Worktree` binding API).
     (`null` = delete). `treeBase` and `parents` are separate parameters: an
     explicit worktree commit builds its tree from `pinBase` but parents on
     `headCommit` (squash semantics). Writes go through isomorphic-git plumbing.
+    Rebuilt directories copy every untouched entry through with mode and oid
+    intact (symlinks and gitlinks included), and a changed file keeps its base
+    entry's mode — editing an executable must not clear `100755`; only new
+    files default to `100644` (the modes locked decision).
 - `ApprovalQueueImpl` (and `SlashCommandAuthorizerImpl`) implement `getGitCache()`;
   the queue's `submitAction` chokepoint runs the `pushedCommits` ancestry
   verification + marking walk, and its rejection/expiry paths run the mark
@@ -463,10 +488,11 @@ agent-facing `Worktree` binding API).
 - **Lazy content in the OT machinery**: `buildChatContent` / session content for
   worktree roots must not materialize the whole tree. Applying a `CodeChange` needs
   base text only for *touched* paths; reads resolve through
-  `readFileAtCommit(pinBase, path)` (fault-pulling the blob if missing). Content maps
+  `readFileAtCommit(pinBase, path)` (fault-pulling the blob if missing).   Content maps
   for worktree ids hold only touched/read files over a lazy base resolver.
   Oversized/binary base files: clean tool error on read; a `set` (whole-file write)
-  is still allowed on any path.
+  is still allowed on those — but not on symlink/gitlink paths, which reject
+  reads *and* writes with the descriptive errors from the modes locked decision.
 - **Epoch reset in `mergeChanges`**: after commits land and pins reset, **every**
   live worktree re-pins in the new generation, and the re-pins are recorded on the
   merge message itself (a new `worktreePins` field, §4). The durable record is
@@ -478,15 +504,21 @@ agent-facing `Worktree` binding API).
   touchedFiles)` — or reuse `headCommit` outright when the flatten equals its tree
   (the agent committed and then made no further edits; no new object needed) — and
   set `pinBase` to it; a clean worktree re-pins at its unchanged `pinBase`.
+  Auto-commit identity is the accepting user's profile — the same
+  `commitIdentityForAuthor(userMeta.profile)` the accept's gadget commits
+  already use — which is cosmetic anyway: auto-commits are squashed out of
+  explicit history, so this identity never appears in anything pushed.
   `headCommit` is untouched. Worktrees never gate accept (no mainline record, no
   staleness).
 - **`Worktree` binding API** (finalize `worktree.d.ts`; the `TODO(now)` file ops):
   - `listFiles(path?, options?: {recursive?: boolean}) → FileMetadata[]` (path +
-    file/dir type; **no size** — git tree entries carry mode, name, and oid but no
+    entry kind — file/executable/dir/symlink/submodule, per the modes locked
+    decision; **no size** — git tree entries carry mode, name, and oid but no
     blob size, and a filtered pull leaves omitted blobs' sizes unknown until
     fetched, so sizes would force fetching every blob).
   - `readFile(path) → string`, `writeFile(path, text)`, `deleteFile(path)` — text
-    oriented; writes/deletes are OT rows exactly like the file tools' (they join
+    oriented, regular files only (symlink/gitlink paths throw the descriptive
+    errors from the modes locked decision); writes/deletes are OT rows exactly like the file tools' (they join
     the same step buffer and land through the same barrier, so replay and the
     UI-someday subscription see them). **`writeFile` on an existing, readable file diffs**: the OT row is a
     minimal edit computed via `diffFiles` (fast-diff) against current content, not
@@ -496,7 +528,8 @@ agent-facing `Worktree` binding API).
     today; adopting the same helper there is a cheap follow-up, out of scope here.)
   - `grep(path, pattern)` / `structuredGrep(path, pattern)` — regex over a file or
     recursively over a directory; **one batched fetch** fills any missing blobs
-    before matching; files over the size cap (and binaries) are skipped, with a note
+    before matching; files over the size cap (and binaries, symlinks, and
+    submodules) are skipped, with a note
     in the output. (`RegExp` params are fine: the binding is served over Workers RPC
     inside the server, which has always supported RegExp serialization.)
   - `commit(message) → oid` — writes a real git commit capturing the worktree's
@@ -522,9 +555,15 @@ agent-facing `Worktree` binding API).
     the step's `"changes"` message (§4) — the durable, sequence-bearing record that revert
     rollback keys on. An advancement is therefore durable iff the call that made
     it is in the transcript: no staging collection, no vouching, and no crash
-    window between them. Commit identity comes from the chat owner
-    (`commitIdentityForAuthor`). Replay is safe: executeCode results are
-    recorded, so the call never re-executes on replay.
+    window between them. Commit identity is the current agent turn's
+    **initiator** — the author of the message that caused the agent to run
+    (the `AiChatAuthorInfo` already threaded through every turn, via
+    `commitIdentityForAuthor`) — so in a collaborative chat a collaborator's
+    work is attributed to the collaborator, matching how accepted commits use
+    the acting user's profile. The initiator therefore has to reach the
+    `Worktree` loopback, which is minted per agent session anyway. Replay is
+    safe: executeCode results are recorded, so the call never re-executes on
+    replay.
   - `diff(commitId?) → string` — unified diff of current content vs. the given
     commit (default `headCommit`). Needs a small git-style unified-diff formatter
     (new utility; we have diff engines but no printer). `commitId` may be any local
@@ -535,7 +574,8 @@ agent-facing `Worktree` binding API).
 ### 3. GitHub gatekeeper: git operations (gatekeeper-github)
 
 - **Session API** — extend `GitHubRepo` (this is the `types.d.ts` TODO), all
-  observations, all stamping `gitCommits` with every commit id they return:
+  observations, all stamping `gitCommits` with every commit id they return
+  (cursor-returning methods stamp per page — see below):
   - `listBranches(filter?) → Cursor<{name, headCommit, ...}>`
   - `listTags(filter?) → Cursor<{name, commit, ...}>`
   - `getCommit(ref) → CommitDetails` — full/truncated SHA, branch, or tag; REST
@@ -544,6 +584,21 @@ agent-facing `Worktree` binding API).
   - `listCommits({branch?, path?, since?, ...}) → Cursor<CommitSummary>` — history
     enumeration.
   - `GitHubPullRequest.listCommits() → Cursor<CommitSummary>`.
+  - **Cursor methods stamp per page.** The existing cursor pattern authorizes
+    once up front and then fetches pages lazily (`github.ts`'s session methods
+    authorize, then return a lazy `StreamingCursor`), so at method-call time no
+    commit ids exist to stamp. The up-front `authorizeObservation` still gates
+    the read exactly as today (and carries no `gitCommits`); the commit ids are
+    advertised by the *pages*: the session wraps the returned cursor in a
+    stamping cursor holding a `dup()` of the approval-queue stub, and each
+    `next()` whose page carries commit ids records a follow-up observation
+    through the same `authorizeObservation` chokepoint with that page's
+    `gitCommits` (titled as a continuation, e.g. "List commits — page 2"). A
+    page with no commit ids records nothing. This preserves the §1 invariant —
+    every advertised commit flows through the chokepoint that writes
+    `pullableFrom` — without making listings eager, at the cost of one
+    observation row per fetched page (bounded by how far the agent actually
+    iterates).
   - Stamp `gitCommits` on existing SHA-bearing observations too (`readDiff`'s
     base/head SHAs, `getDetails` branch refs). Stamps are pull-routing hints
     only; a gatekeeper *may* also `put()` a commit's bytes alongside an
@@ -553,10 +608,21 @@ agent-facing `Worktree` binding API).
 - **`gitPull(oids, cache, hints)`** on the gatekeeper DO (`GitHubGatekeeperImpl`):
   - Smart-HTTP protocol v2 `fetch` against `https://github.com/{o}/{r}.git`
     (token auth): hand-composed pkt-line; `want` per requested oid; `shallow`/
-    `deepen`/`deepen-since` from `hints.commitHistory`; `filter blob:limit=N` from
-    `filterBlobSize` (and `tree:<depth>` when `filterTreeDepth` is set); `have`s
-    from remembered previously-fetched tips (stored in the DO; best-effort only —
-    shallow pulls make missing `have`s cheap); immediate `done`, single round.
+    `deepen`/`deepen-since` from `hints.commitHistory`; **at most one `filter`
+    line per fetch** — upload-pack accepts a single filter-spec, so combining
+    is spelled in the filter-spec grammar, not by repeating the line:
+    `blob:limit=N` from `filterBlobSize` alone, `tree:<depth>` from
+    `filterTreeDepth` alone, and `combine:tree:<depth>+blob:limit=N` when both
+    hints are set (spike 1 verifies GitHub accepts the `combine:` grammar; if
+    it doesn't, the client sends `tree:<depth>` alone — hints are advisory by
+    contract, and the transfer limiter bounds the resulting blob over-fetch).
+    In practice no v1 call site sets both: creation pulls use `blob:limit`
+    only, and the exact-object pull-through defaults are pure tree filters —
+    `tree:0` with a commit want, and `tree:1` with a tree want already
+    excludes the entries' blobs, so no blob filter is needed alongside it.
+    `have`s from remembered previously-fetched tips (stored in the DO;
+    best-effort only — shallow pulls make missing `have`s cheap); immediate
+    `done`, single round.
   - Parse the returned pack — reusing isomorphic-git's pack parsing / delta
     resolution internals if reachable, else a small hand-rolled parser (wire packs
     contain ofs/ref deltas; resolution is the only nontrivial part) — and `put`
@@ -625,17 +691,28 @@ agent-facing `Worktree` binding API).
     carries `buildPack`). Its doc-comment also gains the general contract that
     the overseer may deliver the same apply more than once (crash/retry), so
     implementations must be idempotent — formalizing what crash recovery always
-    implied. The new push action honors it (§3); auditing existing gatekeepers'
-    actions for it is explicitly out of scope here.
+    implied. The comment creates no new obligation: an existing action that
+    duplicates its external mutation on a retried apply (e.g. an unguarded
+    `createIssue`) is already buggy in the wild today, comment or no comment.
+    The new push action honors the contract (§3); making the requirement
+    visible is what this plan ships, and remediating existing gatekeepers'
+    actions is deliberately out of scope (tracked as future work, not silently
+    ignored).
   - `GitPullHints.commitHistory` stays **required** — a default would have to be
     either "full" (which we never intend to request) or an arbitrary depth; better
-    to make every caller say what it means.
+    to make every caller say what it means. `filterBlobSize`/`filterTreeDepth`
+    gain a doc note that both may be set together and that a gatekeeper whose
+    transport can't combine them (upload-pack takes one filter-spec; combining
+    needs the `combine:` grammar, §3) may honor only the tree filter — sound
+    because hints are advisory by contract.
   - Doc comments to the kernel review bar on every export; `@validateRpc()` on the
     implementations (per repo convention — it goes on implementations, not
     interfaces).
 - `worktree.d.ts` finalized per §2 (file ops filled in, commit-squash semantics
   documented from the *agent's* point of view — i.e. not documented at all: the API
-  simply reports the last explicit commit as HEAD).
+  simply reports the last explicit commit as HEAD; the modes behavior *is*
+  documented — `listFiles` kinds, executables keeping their bit, symlinks/
+  submodules erroring on touch — since the agent needs it to interpret errors).
 - `api.ts` changes are minimal but real (tool calls and chat-log message shapes
   live there):
   - a `createWorktree` `AiToolCall` variant, carrying the recorded
@@ -670,8 +747,12 @@ agent-facing `Worktree` binding API).
    SHA `want`s for commits *and* blobs, `shallow` combined with `filter`,
    `blob:limit` and `tree:<depth>` support — including the exact-object mappings
    the pull-through defaults depend on (`tree:0` alongside a commit want — also
-   the "pull a shared ancestor commit alone" flow; `tree:1` + no-blobs alongside
-   a tree want). (Partial-clone lazy fetch implies blob
+   the "pull a shared ancestor commit alone" flow; `tree:1` alongside a tree
+   want, which should exclude the entries' blobs by itself), **and the
+   `combine:tree:<depth>+blob:limit=N` filter-spec grammar** — upload-pack
+   takes one filter-spec per fetch, so honoring both hints at once depends on
+   `combine:` support; §3 defines the fallback (send `tree:<depth>` alone) if
+   GitHub rejects it. (Partial-clone lazy fetch implies blob
    wants work; verify rather than assume — the repo's own AGENTS.md pattern.)
    Include: does `filter blob:limit` suppress **explicitly wanted** blobs? This
    decides the oversized-blob fault path — either the wanted blob never arrives
@@ -705,10 +786,14 @@ agent-facing `Worktree` binding API).
   authority still applies (don't widen the view casually), but don't contort
   the implementation chasing stronger properties here, or claim guarantees
   stronger than these.
-- **Submodules (gitlink entries) are inert everywhere**: the lazy walker and
-  `listFiles` surface them as unsupported entries and never walk through them,
-  the marking walk skips them (§1 — following one would mark a foreign repo's
-  commit), and pushes never include them. Consistent with the text-only scope.
+- **Symlinks and submodules (gitlink entries) are inert everywhere** (the modes
+  locked decision): the lazy walker and `listFiles` surface them with their
+  kind and never walk through a gitlink; file ops on them throw the
+  descriptive errors (naming the symlink target / gitlink commit); grep skips
+  them with a note. The marking walk skips gitlinks (§1 — following one would
+  mark a foreign repo's commit) and pushes never include their target commits,
+  while symlink blobs travel in push closures like any other blob. Consistent
+  with the text-only scope.
 - **Local-root histories are unpushable by design**: a worktree created from a
   purely local commit (gadget history, another worktree) fails ancestry
   verification against every gatekeeper — nothing in its history is proven on
@@ -832,7 +917,10 @@ to be decided later.
    session stub throws) with output verified by real `git index-pack` fixtures,
    walker output
    cross-verified against isomorphic-git over the same store, changed-files
-   commits reusing subtree oids.
+   commits reusing subtree oids and preserving modes (edited `100755` file
+   keeps its bit; untouched symlink/gitlink entries copied through verbatim;
+   new files default `100644`), walker/`listTreeEntries` parsing all five
+   entry modes from a real-git fixture tree.
 3. **backend: worktree records + createWorktree + file tools** — `GadgetRecord` →
    `WorkpieceRecord` (`type` discriminator, optional `bindingName`, null-index
    opt-out) with the full consumer audit (`subscribeToWorkpieces`,
@@ -848,7 +936,9 @@ to be decided later.
    **client delivery filtering** (rows, replay, messages, metadata;
    revision-preserving). Tests: create/replay determinism,
    create-from-local-commit (no gatekeeper), edit-through-OT on a worktree, lazy
-   blob fault, oversize/binary read errors, revert-deletes-worktree, chat-deletion
+   blob fault, oversize/binary read errors, symlink/gitlink touch errors
+   (message names the link target / submodule commit; writes rejected too),
+   revert-deletes-worktree, chat-deletion
    cleanup, other-chat invisibility, and the client-subscription leak test (no
    worktree `CodeChange` entries, pins, or commit content in delivered traffic —
    bare worktree ids in tool calls are expected; gapless revisions across
@@ -864,7 +954,10 @@ to be decided later.
    worktree preserves
    content and squashes (explicit commit parents on last explicit head after N
    accepts, tree built from pinBase + overlay only), commit() leaves pins/rows
-   untouched (no double-apply on replay; empty diff right after), boundary re-pin
+   untouched (no double-apply on replay; empty diff right after), commit
+   identity is the turn initiator (collaborator's turn → collaborator's
+   name), `listFiles` entry kinds and executable-edit-keeps-mode end to end,
+   boundary re-pin
    replay from `worktreePins` (incl. across a compaction checkpoint), commit
    determinism, `writeFile` emits minimal edits (and `set` for new/unreadable
    files), diff output goldens, grep batch-fill (one pull for a directory of
@@ -875,14 +968,19 @@ to be decided later.
    multiple commits within one step (advancements ordered within the message).
 5. **github: session git reads** — `listBranches`/`listTags`/`getCommit`/
    `listCommits`/PR `listCommits`, `gitCommits` stamping (new + existing SHA-bearing
-   observations), types.d.ts docs. Pure REST; no protocol code yet. Tests extend
-   `github-api.test.ts` patterns.
+   observations; per-page follow-up observations from the stamping cursor
+   wrapper), types.d.ts docs. Pure REST; no protocol code yet. Tests extend
+   `github-api.test.ts` patterns; include per-page stamping (every commit id a
+   cursor returns appears in some recorded observation's `gitCommits`; pages
+   never fetched are never stamped; commit-free pages record nothing).
 6. **github: fetch transport + gitPull** — pkt-line composer/parser, protocol-v2
    fetch client (wants/shallow/filter/haves/done), pack unpacking into `GitCache`,
    fetched-tips memory, transfer-size limiting, oversized-blob handling per spike 1.
    Tests: pkt-line round-trips, pack fixtures produced by real git (incl. delta
-   objects), hint mapping, tips-based have construction. (Spikes 1–2 land before or
-   with this commit.)
+   objects), hint mapping — including the hints-to-filter-spec matrix (blob
+   only, tree only, both → `combine:` or the tree-only fallback per spike 1's
+   outcome; never two `filter` lines) — and tips-based have construction.
+   (Spikes 1–2 land before or with this commit.)
 7. **github: push + PR-from-commit** — `push` action (queue/simulate/apply/
    revert): `pushedCommits` declaration, simulation overlay reading pending
    commits via `get()`, apply = `buildPack` stream → send-pack framing +
@@ -926,3 +1024,6 @@ to be decided later.
   pushes of *pre-existing* diverged branches (§1's ancestry-verification bound:
   the head-to-ancestor commit chain must be cached).
 - Other git hosts (the gatekeeper interface is host-neutral by construction).
+- Auditing existing gatekeepers' actions for `applyAction` idempotency (the
+  contract §4 documents; a pre-existing crash-tolerance requirement, not one
+  this plan introduces).
