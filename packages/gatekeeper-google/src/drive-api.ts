@@ -12,6 +12,7 @@ const MAX_BATCH_RESPONSE_BYTES = 1_000_000;
 const MAX_JSON_RESPONSE_BYTES = 5_000_000;
 const DRIVE_API_TIMEOUT_MS = 30_000;
 const CREATION_REQUEST_PROPERTY = "gadgetsCreationRequestId";
+const MAX_CREATION_MARKER_PAGES = 100;
 const UUID_V4_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const logger = obsContext.createLogger({
@@ -31,8 +32,16 @@ export type DriveFile = {
   webViewLink?: string;
   trashed?: boolean;
   shortcutDetails?: { targetId?: string; targetMimeType?: string };
+  appProperties?: { gadgetsCreationRequestId?: string };
   capabilities?: { canAddChildren?: boolean; canTrash?: boolean };
 };
+
+/** Whether metadata carries a valid marker, optionally for one exact request. */
+export function hasDriveCreationMarker(file: DriveFile, requestId?: string): boolean {
+  let marker = file.appProperties?.[CREATION_REQUEST_PROPERTY];
+  return marker !== undefined && UUID_V4_PATTERN.test(marker) &&
+    (requestId === undefined || marker === requestId);
+}
 
 /** Current metadata for one shared drive. */
 export type DriveInfo = { id: string; name: string };
@@ -41,7 +50,7 @@ export type DriveInfo = { id: string; name: string };
 export const DRIVE_FILE_ITEM_FIELDS = [
   "id", "name", "mimeType", "modifiedTime", "size", "parents", "driveId", "trashed",
   "owners(displayName,emailAddress)", "webViewLink",
-  "shortcutDetails(targetId,targetMimeType)",
+  "shortcutDetails(targetId,targetMimeType)", "appProperties",
   "capabilities(canAddChildren,canTrash)",
 ].join(",");
 
@@ -252,6 +261,14 @@ function parseDriveFile(value: unknown): DriveFile {
   }
   let parents = optionalStringArray(value.parents, "file parents");
   let trashed = optionalBoolean(value.trashed, "file trashed state");
+  let appProperties: DriveFile["appProperties"];
+  if (value.appProperties !== undefined) {
+    if (!isRecord(value.appProperties)) throw new Error("Invalid Google Drive app properties");
+    let requestId = optionalString(
+      value.appProperties[CREATION_REQUEST_PROPERTY], "creation request app property",
+    );
+    appProperties = requestId ? { [CREATION_REQUEST_PROPERTY]: requestId } : {};
+  }
   let capabilities = parseDriveCapabilities(value.capabilities);
   return {
     id: value.id,
@@ -263,6 +280,7 @@ function parseDriveFile(value: unknown): DriveFile {
     ...(owners ? { owners } : {}),
     ...(trashed === undefined ? {} : { trashed }),
     ...(shortcutDetails ? { shortcutDetails } : {}),
+    ...(appProperties ? { appProperties } : {}),
     ...(capabilities ? { capabilities } : {}),
   };
 }
@@ -421,11 +439,15 @@ export class DriveApi {
       parents: [options.parentId],
       appProperties: { [CREATION_REQUEST_PROPERTY]: options.requestId },
     };
-    return parseDriveFile(await this.#requestUnknown("/files", params, "create file", {
+    let file = parseDriveFile(await this.#requestUnknown("/files", params, "create file", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }));
+    if (!hasDriveCreationMarker(file, options.requestId)) {
+      throw new Error("Google Drive creation marker matched unexpected file metadata");
+    }
+    return file;
   }
 
   /** Find the sole file carrying a gatekeeper-generated creation marker. */
@@ -439,18 +461,28 @@ export class DriveApi {
       supportsAllDrives: "true",
       includeItemsFromAllDrives: "true",
     });
-    let body = await this.#getUnknown("/files", params, "find created file");
-    if (!isRecord(body)) throw new Error("Invalid Google Drive file-list response");
-    let files: DriveFile[] = [];
-    if (body.files !== undefined) {
-      if (!Array.isArray(body.files)) throw new Error("Invalid Google Drive file-list response");
-      files = body.files.map(parseDriveFile);
+    let found: DriveFile | undefined;
+    for (let page = 0; page < MAX_CREATION_MARKER_PAGES; page++) {
+      let body = await this.#getUnknown("/files", params, "find created file");
+      if (!isRecord(body)) throw new Error("Invalid Google Drive file-list response");
+      if (body.files !== undefined) {
+        if (!Array.isArray(body.files)) throw new Error("Invalid Google Drive file-list response");
+        for (let value of body.files) {
+          let file = parseDriveFile(value);
+          if (!hasDriveCreationMarker(file, requestId)) {
+            throw new Error("Google Drive creation marker matched unexpected file metadata");
+          }
+          if (found) {
+            throw new Error("Multiple Google Drive files matched one creation request");
+          }
+          found = file;
+        }
+      }
+      let nextPageToken = optionalString(body.nextPageToken, "nextPageToken");
+      if (!nextPageToken) return found;
+      params.set("pageToken", nextPageToken);
     }
-    let nextPageToken = optionalString(body.nextPageToken, "nextPageToken");
-    if (files.length > 1 || nextPageToken !== undefined) {
-      throw new Error("Multiple Google Drive files matched one creation request");
-    }
-    return files[0];
+    throw new Error("Google Drive creation marker lookup exceeded its page limit");
   }
 
   /** Move one Drive item to trash. */

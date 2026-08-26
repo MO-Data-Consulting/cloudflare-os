@@ -56,7 +56,6 @@ describe("embedded agent declarations", () => {
 
   it("compiles the exact Google Drive agent declaration bundle without module dependencies", () => {
     const types = [
-      "declare class RpcTarget {}",
       source("docs-read-types.txt"),
       source("sheets-types.txt"),
       stripTypeModulePrefix(source("drive-types.txt"), DRIVE_TYPES_MODULE_PREFIX),
@@ -67,7 +66,6 @@ describe("embedded agent declarations", () => {
 
   it("keeps the Drive declaration aligned after module-only imports", () => {
     const modulePrefix =
-      'import type { RpcTarget } from "cloudflare:workers";\n' +
       'import type { GoogleDocReadSession } from "./docs-read-types";\n' +
       'import type { GoogleSpreadsheetSession } from "./sheets-types";\n\n';
     const driveTypes = source("drive-types.d.ts");
@@ -98,7 +96,6 @@ describe("embedded agent declarations", () => {
 
   it("splits Drive creation authority from read-only sessions", () => {
     const types = [
-      "declare class RpcTarget {}",
       source("docs-read-types.txt"),
       stripTypeModulePrefix(source("docs-types.txt"), DOCS_TYPES_MODULE_PREFIX),
       source("sheets-types.txt"),

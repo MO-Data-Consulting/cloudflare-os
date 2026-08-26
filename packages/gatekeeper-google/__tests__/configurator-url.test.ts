@@ -126,16 +126,17 @@ describe("Drive configurator URLs", () => {
     expect(parseResourceUrl(url)).toEqual({ kind: "driveAccount" });
   });
 
-  it("explains native Doc and Sheet reads at every Drive scope", () => {
+  it("advertises creation only for account and shared-drive bindings", () => {
     expect(renderedCopy(driveAccountConfigurator)).toContain(
-      "native Google Docs and Sheets can be opened in read-only content sessions.",
+      "approved blank-item creation",
     );
     expect(renderedCopy(sharedDriveConfigurator)).toContain(
-      "Search its files and read native Google Docs and Sheets.",
+      "create blank Docs, Sheets, and folders",
     );
     expect(renderedCopy(driveFileConfigurator)).toContain(
-      "A selected native Google Doc or Sheet also provides read-only content.",
+      "one read-only file binding",
     );
+    expect(renderedCopy(driveFileConfigurator)).not.toContain("create blank");
   });
 
   it("round-trips an encoded shared-drive ID", () => {

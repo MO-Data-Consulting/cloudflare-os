@@ -38,7 +38,8 @@ describe("resource declarations", () => {
     expect(GOOGLE_DRIVE_RESOURCE.description).toBe(
       "Find files and folders anywhere this Google account can read in Drive, including shared " +
       "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
-      "results contain metadata only, while native Google Docs and Sheets can be opened read-only.",
+      "results contain metadata only, while native Google Docs and Sheets can be opened read-only " +
+      "and blank Docs, Sheets, and folders can be created in writable destinations.",
     );
   });
 
@@ -77,7 +78,7 @@ describe("resource declarations", () => {
     expect(new Set(Object.values(RESOURCE_BY_KIND)).size).toBe(SUPPORTED_RESOURCES.length);
   });
 
-  it("advertises native Docs and Sheets only on Drive resources", () => {
+  it("advertises creation only on broad Drive resources", () => {
     expect([
       GOOGLE_DRIVE_RESOURCE.description,
       GOOGLE_SHARED_DRIVE_RESOURCE.description,
@@ -85,8 +86,9 @@ describe("resource declarations", () => {
     ]).toEqual([
       "Find files and folders anywhere this Google account can read in Drive, including shared " +
       "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
-      "results contain metadata only, while native Google Docs and Sheets can be opened read-only.",
-      "Find files and folders, and read native Google Docs and Sheets, in one organization-owned shared drive.",
+      "results contain metadata only, while native Google Docs and Sheets can be opened read-only " +
+      "and blank Docs, Sheets, and folders can be created in writable destinations.",
+      "Find files and folders, read native Google Docs and Sheets, and create blank Docs, Sheets, and folders in one organization-owned shared drive.",
       "Read metadata and, for a native Google Doc or Sheet, content from one Drive file.",
     ]);
   });
