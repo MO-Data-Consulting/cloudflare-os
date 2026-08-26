@@ -21,7 +21,7 @@ Supporting cast:
   populating `ObservationDescription.gitCommits`, every push declaring
   `ActionDescription.pushedCommits`.
 
-The starting point is the sketch in commit 2500f71, encompassing changes in
+The starting point is the sketch in commit 34ebecd, encompassing changes in
 `workshop-shared/src/gatekeeper.ts` (`GitOid`/`GitObjectType`/`GitCache`/
 `GitPullHints`, `Gatekeeper.gitPull?()`, `ObservationAuthorizer.getGitCache()`,
 `ObservationDescription.gitCommits?`) and `workshop-shared/src/worktree.d.ts` (the
@@ -426,7 +426,7 @@ agent-facing `Worktree` binding API).
     read-before-edit gate works as-is. `writeFile`/`editFile` emit ordinary OT rows.
   - **System prompt: worktrees are never mentioned.** The prompt aims to be
     byte-stable across a chat's turns for prompt caching (the seed binding layer is
-    frozen per chat for exactly this reason, agent.ts:1325-1334; mid-chat
+    frozen per chat for exactly this reason, agent.ts:1332-1341; mid-chat
     acquisitions are announced via chat history, not the prompt). Since worktrees
     are created mid-chat by the agent itself, the `createWorktree` call and tool
     result in the chat history *are* the announcement; adding a prompt line would
@@ -585,7 +585,7 @@ agent-facing `Worktree` binding API).
 
 ### 4. Shared API finalization (workshop-shared)
 
-- The `gatekeeper.ts` types from 2500f71 land essentially as sketched, with:
+- The `gatekeeper.ts` types from 34ebecd land essentially as sketched, with:
   - `GitCache` finalized as `get(oid, hints?)` / `has` / `stat` / `put` /
     `buildPack()` (§1); the sketch's `pull()` TODO resolves by *deletion* —
     gatekeepers never trigger pulls. Doc-comment the scoped view
@@ -774,7 +774,7 @@ to be decided later.
    crash bug independently of worktrees, and commits 3–4 assume the per-step
    buffer and transactional barrier it introduces (worktree edits and `commit()`
    head advancements have no crash machinery of their own).
-1. **shared: git cache API** (workshop-shared) — finalize changes from 2500f71:
+1. **shared: git cache API** (workshop-shared) — finalize changes from 34ebecd:
    `gatekeeper.ts` additions (`GitCache` as scoped `get(oid, hints?)`/`has`/
    `stat`/`put`/`buildPack` with the parallel-`put` doc note and the simulation
    contract, `GitPullHints` with `commitHistory` required, `Gatekeeper.gitPull`,
