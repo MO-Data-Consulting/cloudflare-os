@@ -33,23 +33,41 @@ agent-facing `Worktree` binding API).
   the chat. Fresh agents create their own worktrees. Nothing structural forbids
   workspace-scoped worktrees later (worktrees get ordinary `WorkpieceId`s from the
   shared counter), but no cross-chat visibility ships now.
-- **No UI — enforced by server-side delivery filtering.** Worktrees do not appear in
-  the workshop UI at all; a future change can add a `WorkpieceSummary` variant when
-  the UI is ready for large repos. This takes more than filtering
+- **No UI — worktree *content* is stripped from client deliveries.** Worktrees do
+  not appear in the workshop UI at all; a future change can add a `WorkpieceSummary`
+  variant when the UI is ready for large repos. This takes more than filtering
   `subscribeToWorkpieces`: the frontend's OT client consumes the same chat change
   stream the agent writes, and when a row touches a pinned workpiece it fetches the
   entire base commit (`otClient.ts` → `getCodeAtCommit`) — for a worktree that would
   be a whole repo, materialized on both ends of the wire. So the server strips
-  worktree content from **every client delivery**: `changeApplied` events and
+  worktree entries from **every client delivery**: `changeApplied` events and
   subscribe-replay rows (worktree entries removed; revision numbers preserved, so a
   stripped row may carry an empty change but the revision stream stays gapless),
   delivered `"changes"`/`"merge"` messages' change payloads and pins, and `codeBase`
   metadata pins. This is sound because `CodeChange` transform is per-workpiece: ids
   are disjoint, so a client's gadget edits transform identically against a stripped
-  row and the original — and clients can never author worktree changes, since they
-  have no UI for them. (Frontend-side "ignore unknown ids" was rejected: the
-  client's workpiece list arrives on a different subscription than the change
-  stream, so classification would race.)
+  row and the original. Two deliberate non-goals sharpen what "no UI" means:
+  - **Worktree *ids* are not hidden from clients.** The delivered `createWorktree`
+    tool call carries `worktreeId`, and the transcript renders the creation (§4) —
+    both intentional, and a follow-up intends to expose worktrees to clients
+    outright. Stripping only guarantees that nothing in delivered traffic makes
+    the *existing* client fetch worktree content: no worktree `CodeChange`
+    entries, no worktree pins (a pin is what triggers `otClient.ts`'s
+    `getCodeAtCommit` base fetch), no commit content.
+  - **Client-submitted worktree changes are not rejected.** `submitCodeChange`
+    accepts arbitrary workpiece ids from the client, and this plan deliberately
+    leaves that alone: a hand-rolled client that targets its own chat's worktree
+    gets its change applied like any other (and the agent sees it), while
+    stripping means such a client operates blind — its own rows echo back empty.
+    That is acceptable: client worktree editing is intended follow-up work anyway,
+    a worktree change conveys no authority the chat's client doesn't already have
+    (same chat, same edit rights the agent's file tools exercise), and
+    per-workpiece transform keeps such rows from perturbing anyone's gadget
+    edits. "No UI" is a statement about what the shipped frontend does, not a
+    server-enforced invariant.
+  (Frontend-side "ignore unknown ids" was rejected: the client's workpiece list
+  arrives on a different subscription than the change stream, so classification
+  would race.)
 - **Edits ride the existing chat OT stream.** `CodeChange` is already keyed by
   `WorkpieceId` and pins are `{gadgetId, baseCommit}`; a worktree is *born pinned* at
   its base commit, so readFile/writeFile/editFile, the read-before-edit gate,
@@ -267,14 +285,15 @@ agent-facing `Worktree` binding API).
     queued pushes, keyed to the action so it can be cleaned up.
 - **Pull driver** `ensureGitObjects(oids, hints)` in the overseer: look up
   `onRemote ∪ pullableFrom` in `gitObjectMetadata` (trying each recorded
-  gatekeeper on failure), mint the gatekeeper stub through the existing
-  `getGatekeeperClassFor` chokepoint (so disabled gatekeepers/resources stay
-  enforced), call `gitPull(oids, cache, hints)`, verify the requested oids are
-  now present. A deleted gatekeeper record → clear error to the agent
-  ("reconnect X to pull this commit"). Reachable only from overseer-initiated
-  paths — agent-side faults (worktree creation and lazy reads) and the
-  `get()`/`buildPack()` pull-through of `pendingPush`-marked objects — so a
-  gatekeeper can never direct a pull of anything outside a verified queued push.
+  gatekeeper on failure), reach the gatekeeper through `getGatekeeperFacet(id)` —
+  the same instantiated-facet path every other invocation of an existing
+  gatekeeper uses (observations, actions, hooks; overseer.ts:4261) — call
+  `gitPull(oids, cache, hints)`, verify the requested oids are now present.
+  A deleted gatekeeper record → clear error to the agent ("reconnect X to pull
+  this commit"). Reachable only from overseer-initiated paths — agent-side
+  faults (worktree creation and lazy reads) and the `get()`/`buildPack()`
+  pull-through of `pendingPush`-marked objects — so a gatekeeper can never direct
+  a pull of anything outside a verified queued push.
 - **Lazy walker** (`ensureObject` + hand-rolled parsers, per the locked decision):
   the read-side codec — loose-object header/inflate helpers shared with
   `GitCacheImpl`, plus tree/commit parsers — powering the new lazy read paths.
@@ -742,9 +761,13 @@ agent-facing `Worktree` binding API).
   subscribe-replay of retained rows, message delivery (`"changes"`/`"merge"`
   payloads and pins), and chat metadata (`codeBase` pins). Miss one and the
   frontend's OT client fetches a repo-sized base commit. Test by subscribing as a
-  client to a chat with an active worktree and asserting no worktree id, pin, or
-  commit content appears anywhere in the received traffic — and that the revision
-  stream stays gapless across stripped rows.
+  client to a chat with an active worktree and asserting no worktree `CodeChange`
+  entry, pin, or commit content appears anywhere in the received traffic — and
+  that the revision stream stays gapless across stripped rows. The assertion is
+  deliberately *not* "no worktree id anywhere": the delivered `createWorktree`
+  tool call carries `worktreeId` by design (see the delivery-filtering locked
+  decision), and a bare id triggers nothing in the existing client — the test
+  guards exactly the set of things that would make `otClient.ts` fetch content.
 - **`getCodeAtCommit` is client-callable with an arbitrary oid** and materializes
   the full tree server-side; a client that learns a worktree commit id must not be
   able to make the overseer materialize (or fault-pull) a repo-scale tree. Guard
@@ -827,8 +850,9 @@ to be decided later.
    create-from-local-commit (no gatekeeper), edit-through-OT on a worktree, lazy
    blob fault, oversize/binary read errors, revert-deletes-worktree, chat-deletion
    cleanup, other-chat invisibility, and the client-subscription leak test (no
-   worktree data in any delivered traffic; gapless revisions across stripped
-   rows).
+   worktree `CodeChange` entries, pins, or commit content in delivered traffic —
+   bare worktree ids in tool calls are expected; gapless revisions across
+   stripped rows).
 4. **backend: epochs + Worktree binding API** — auto-commit + re-pin at
    `mergeChanges` reset (`worktreePins` on the merge message, headCommit reuse
    when trees match, squash semantics), the `Worktree` RpcTarget (listFiles/
@@ -890,7 +914,10 @@ to be decided later.
 - `buildPack` internals: deltified/thin packs, and streaming a source
   gatekeeper's pack straight through to the destination without staging every
   object in the cache.
-- Cross-chat / workspace-scoped worktrees; user editing of worktrees.
+- Cross-chat / workspace-scoped worktrees; user editing of worktrees (intended
+  follow-up — `submitCodeChange` already accepts worktree-targeted changes, see
+  the delivery-filtering locked decision; what's missing is UI and unstripped
+  delivery).
 - `merge` / `reset` on the Worktree API.
 - Unifying `GatekeeperRecord` into the workpiece table.
 - Diff-based `writeFile` for the gadget writeFile agent tool (same helper).
