@@ -177,6 +177,20 @@ agent-facing `Worktree` binding API).
   unchanged (tree rebuilds copy mode + oid verbatim), and symlink blobs
   travel in push closures like any blob; gitlink target *commits* are still
   never pulled, walked, or pushed (§1).
+- **Paths are strict UTF-8; a non-UTF-8 tree entry name throws.** Git permits
+  arbitrary non-NUL bytes in entry names, but every layer above the object
+  store here speaks string paths, and a *lossy* decode (replacement
+  characters) could alias two distinct byte names to one string path —
+  making an edit silently target or overwrite the wrong entry. So the tree
+  parser decodes entry names with a fatal `TextDecoder`: parsing a tree that
+  contains an invalid name fails with an error naming the tree oid and the
+  offending bytes (hex-escaped). Strict decode is reversible — re-encoding
+  yields the exact original bytes — so names that pass can never alias, and
+  the write side (already UTF-8) round-trips them byte-identically,
+  preserving oids. Non-UTF-8 names are vanishingly rare in practice; if one
+  is ever actually hit, decide the accommodation then rather than designing
+  an escaping scheme now. (Gadget trees are unaffected — always our own
+  UTF-8 writes.)
 - **Lazy reads are a hand-rolled walker, not isomorphic-git.** The new
   read-on-demand paths (per-path tree walk, entry listing, commit header reads) parse
   git objects themselves and call `ensureObject(oid, {type, referencedBy})` before
@@ -635,19 +649,43 @@ agent-facing `Worktree` binding API).
   - Queue: the `ActionDescription` declares `pushedCommits: [commitId]`, and the
     overseer's `submitAction` verification + marking (§1) *is* the validation —
     an unrelated commit, a missing ancestor, or an unproven root fails right
-    there, agent-visible, before anything is queued. Description names repo,
-    branch, commit, force-ness. Simulation overlays the pending push onto
-    `listBranches`/`getCommit` reads per the write-gatekeeper simulation
-    convention, reading pending commits via `GitCache.get()` — which serves
-    (pulling through if needed) exactly what is queued for push to this remote,
-    to be treated as already pushed.
+    there, agent-visible, before anything is queued. **The queue path also
+    binds the expected remote ref state**: the DO reads the branch's current
+    head (zero-id if the branch doesn't exist) and stores
+    `{branch, expectedOldSha, newSha, force}` as the per-action record — what
+    the user approves is "move `branch` from `expectedOldSha` to `newSha`",
+    not "move `branch` from wherever it is by then". A non-force push
+    additionally requires `expectedOldSha` to be an ancestor of `newSha`,
+    checked at queue time by walking the cached commit chain (the ancestry
+    verification already guarantees that chain is cached down to a proven
+    commit); a head that isn't in it fails queuing with "branch has moved /
+    not a fast-forward — pull the new head and rebase, or force". **Branch
+    creation (`expectedOldSha` = zero-id) is exempt** from this check — there
+    is no old head to fast-forward from, and the zero-id CAS at apply is what
+    protects against a branch appearing in the interim — so non-force pushes
+    can create branches. `force`
+    controls *only* this fast-forward policy check — it does not loosen
+    old-SHA matching at apply (below). Description names repo, branch, commit,
+    force-ness, and the expected old head. Simulation overlays the pending
+    push onto `listBranches`/`getCommit` reads per the write-gatekeeper
+    simulation convention — branch at `expectedOldSha` reads as `newSha`,
+    exactly the transition apply will enforce — reading pending commits via
+    `GitCache.get()`, which serves (pulling through if needed) exactly what is
+    queued for push to this remote, to be treated as already pushed.
   - Apply: **no gatekeeper-side object walk at all** — call `buildPack()` on the
     action-scoped `GitCache` stub passed to `applyAction()` (approval can happen
     hours after the session that queued the action, so the cache must arrive
     with the apply call — §1/§4) and stream the pack into a send-pack request
-    with the ref-update command (`old-sha new-sha refs/heads/branch`, zero-id
-    old-sha creates the branch; non-force update requires old-sha match — a
-    stale old-sha fails apply with a clear error). The overseer composes the
+    with the ref-update command (`old-sha new-sha refs/heads/branch`), where
+    **old-sha is the queue-time `expectedOldSha`** (zero-id for branch
+    creation). Receive-pack's old-SHA compare-and-swap applies to *every*
+    update, force or not — the wire protocol has no force bit, and fast-forward
+    policy was already enforced at queue time — so a branch that moved between
+    approval and apply fails the apply cleanly instead of being clobbered:
+    a force push can't stomp work that landed while approval was pending, and
+    a branch created in the interim fails the zero-id CAS rather than being
+    overwritten. The error tells the agent the branch moved; the recovery is
+    to re-observe and queue a fresh push against the new head. The overseer composes the
     pack from the action's pending-push marks, faulting in any absent marked
     objects from their recorded sources — that is the cross-remote
     (pull-from-A-push-to-B) case, batched; a push back to the origin costs
@@ -655,15 +693,24 @@ agent-facing `Worktree` binding API).
     has. An oversized blob in the closure fails a cross-remote push with a clear
     error when the pull-through hits `put()`'s size rejection — accepted for
     now (a same-origin push never meets one: it's remote-known and excluded).
-    **Apply is idempotent** (the §4 `applyAction` contract): before sending, the
-    DO durably records a per-action intent `{branch, oldSha, newSha}` (it reads
-    the branch head to compose old-sha anyway); a retried apply that finds the
-    intent recorded and the remote branch already at `newSha` reports success
-    instead of failing on a stale old-sha, with `previousSha = intent.oldSha` —
-    so revert metadata survives the crash window between GitHub accepting the
-    push and the overseer persisting the completion. Record `previousSha` as
-    revert info; revert = ref rollback (or delete, if the push created the
-    branch); the pushed objects stay `onRemote` (§1).
+    **Apply is idempotent with deliberately desired-state semantics** (the §4
+    `applyAction` contract): apply succeeds iff the branch ends up at `newSha`
+    — by our CAS'd push, or by finding it already there. The intended
+    transition `{branch, expectedOldSha, newSha}` is durable in the per-action
+    record from queue time, and there is **no durable "apply attempted"
+    marker** (decided): an apply that finds the branch already at `newSha`
+    reports success with `previousSha = expectedOldSha` without knowing
+    whether an earlier attempt landed it (the crash window between GitHub
+    accepting the push and the overseer persisting the completion — the case
+    that matters) or a third party independently pushed the exact same commit
+    id before our first attempt (a freak case: same oid = byte-identical
+    outcome, so the approved end state holds either way and success is the
+    honest report). In that freak case a later revert rolls the branch back
+    to `expectedOldSha`, undoing the third party's identical push too —
+    accepted: the two histories are indistinguishable without a marker, and
+    the revert restores exactly the pre-approval state the user looked at
+    when approving. Revert = ref rollback to `previousSha` (or delete, if the
+    push created the branch); the pushed objects stay `onRemote` (§1).
   - "Create a PR from a commit" = `push` to a branch + the existing
     `createPullRequest` (document the flow in types.d.ts; add a convenience only if
     it earns its keep).
@@ -920,7 +967,10 @@ to be decided later.
    commits reusing subtree oids and preserving modes (edited `100755` file
    keeps its bit; untouched symlink/gitlink entries copied through verbatim;
    new files default `100644`), walker/`listTreeEntries` parsing all five
-   entry modes from a real-git fixture tree.
+   entry modes from a real-git fixture tree, non-UTF-8 entry name → fatal
+   decode error naming the tree oid (fixture tree written with raw bytes),
+   UTF-8 names round-tripping byte-identically through parse + rebuild
+   (unchanged subtree oids preserved).
 3. **backend: worktree records + createWorktree + file tools** — `GadgetRecord` →
    `WorkpieceRecord` (`type` discriminator, optional `bindingName`, null-index
    opt-out) with the full consumer audit (`subscribeToWorkpieces`,
@@ -986,10 +1036,16 @@ to be decided later.
    commits via `get()`, apply = `buildPack` stream → send-pack framing +
    ref-update command; types.d.ts flow docs for push + createPullRequest.
    Tests: queue-time rejection surfaces to the agent (unrelated commit, missing
-   ancestry, unproven root), simulation reads pending commits as pushed,
-   ref-update encoding, force/non-force, stale old-sha failure, idempotent
-   re-apply (intent recorded, remote already at `newSha` → success with the
-   original `previousSha`), revert to `previousSha`, branch-creation push,
+   ancestry, unproven root, non-force non-fast-forward against the queue-time
+   head), simulation reads pending commits as pushed (branch at
+   `expectedOldSha` → `newSha`),
+   ref-update encoding, branch-moved-after-approval CAS failure for force and
+   non-force alike (and zero-id CAS failure when the branch appeared in the
+   interim), desired-state
+   apply (remote already at `newSha` → success with
+   `previousSha = expectedOldSha`, whether a retry or a first attempt),
+   revert to `previousSha`, branch-creation push (non-force — zero-id exempt
+   from the fast-forward check),
    cross-remote push end-to-end against two mock remotes (pull shared ancestor
    from B → push A-derived commits to B, absent filtered blobs pulled through
    during `buildPack`; oversized cross-remote failure).
