@@ -345,6 +345,18 @@ export class DriveSessionCore {
     return file.id;
   }
 
+  /** Fetch one exact app-created file after scope-checking and authorizing its metadata. */
+  async inspectCreatedFile(fileId: string): Promise<DriveFile> {
+    if (this.#scope.kind === "file") this.#outsideScope();
+    let file = await this.#getFileInScope(fileId);
+    if (file.id !== fileId) this.#outsideScope();
+    await this.#authorizeIds(
+      [file.id],
+      "Open app-created Google Doc",
+      `Check current metadata for app-created Drive file ${file.id}.`,
+    );
+    return file;
+  }
   #cursor(query: DriveListFilesOptions, denyEmptySearch = false): Pager<DriveEntry> {
     let hasDisclosedEntries = false;
     return new CursorPager<DriveFile, DriveEntry>({
@@ -396,7 +408,6 @@ export class DriveSessionCore {
       ? { kind: "drive", driveId: this.#scope.driveId }
       : { kind: "user" };
   }
-
 
   async #assertParent(parentId: string): Promise<void> {
     if (this.#scope.kind === "file") this.#outsideScope();

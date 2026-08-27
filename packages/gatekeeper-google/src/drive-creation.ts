@@ -1,4 +1,4 @@
-import type { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
+import type { ActionKind, ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import { formatApprovalField, sanitizeApprovalTitle } from "./approval-format";
 import { hasDriveCreationMarker, type DriveApi, type DriveFile } from "./drive-api";
 import {
@@ -9,8 +9,8 @@ import type { DriveCreationHandle, DriveCreationKind } from "./drive-types";
 import { PendingActionStore, type PendingActionStorage } from "./pending-action-store";
 import { obsContext } from "./observability";
 
-const OUTCOME_PREFIX = "drive:create:outcome:";
-const NEXT_OUTCOME_SEQUENCE_KEY = "drive:create:nextOutcomeSequence";
+const OUTCOME_PREFIX = "drive:action:outcome:";
+const NEXT_OUTCOME_SEQUENCE_KEY = "drive:action:nextOutcomeSequence";
 const MAX_PENDING_CREATIONS = 100;
 const MAX_TERMINAL_OUTCOMES = 100;
 
@@ -24,6 +24,12 @@ const KIND_LABEL: Record<DriveCreationKind, string> = {
   googleDoc: "Google Doc",
   googleSheet: "Google Sheet",
   folder: "folder",
+};
+
+/** Auto-approval kind for creating one blank native Google Doc. */
+export const CREATE_GOOGLE_DOC_ACTION: ActionKind = {
+  tag: "createGoogleDoc",
+  label: "Google Doc creation",
 };
 
 const logger = obsContext.createLogger({
@@ -40,19 +46,41 @@ export type DriveCreationApi = Pick<
 
 /** Authoritative request persisted until the approval callback reaches a terminal state. */
 export type DriveCreationAction = {
+  actionType: "create";
   kind: DriveCreationKind;
   name: string;
   parentId: string;
   parentAuthority: DriveCreationParent["authority"];
   requestId: string;
+  submittedAt: number;
 };
+
+/** Markdown mutation queued against one logical Drive-created Google Doc. */
+export type DriveDocEditPayload =
+  | { type: "replaceText"; oldMarkdown: string; newMarkdown: string }
+  | { type: "appendText"; markdown: string };
+
+/** Drive-only pending Doc edit stored in the binding-wide approval sequence. */
+export type DriveDocEditAction = {
+  actionType: "docEdit";
+  driveCreationId: number;
+  submittedAt: number;
+  edit: DriveDocEditPayload;
+  writeId: string;
+  invalidatedReason?: string;
+};
+
+/** Every Drive action sharing one binding-local approval sequence. */
+export type DriveAction = DriveCreationAction | DriveDocEditAction;
 
 /** Persisted callback outcome; provider metadata is intentionally represented only by file ID. */
 export type StoredDriveCreationOutcome =
   | { status: "applying"; createdFileId?: string }
   | { status: "rejected" }
   | { status: "failed"; message: string; createdFileId?: string }
-  | { status: "created"; kind: DriveCreationKind; fileId: string }
+  | {
+      status: "created"; kind: DriveCreationKind; fileId: string; requestId: string;
+    }
   | { status: "reverted" };
 
 /** Current authoritative state before created metadata is freshly observed. */
@@ -62,14 +90,16 @@ export type StoredDriveCreationState =
   | { status: "created"; kind: DriveCreationKind; fileId: string }
   | { status: "reverted" };
 
+type StoredDocEditReceipt = { actionType: "docEdit" };
+
 type StoredOutcomeRecord = {
   sequence: number;
-  outcome: StoredDriveCreationOutcome;
+  outcome: StoredDriveCreationOutcome | StoredDocEditReceipt;
 };
 
-/** Durable action and bounded outcome storage for one Drive binding. */
+/** Durable mixed-action storage with bounded receipts and persistent created-Doc identities. */
 export class DriveCreationStore {
-  #actions: PendingActionStore<DriveCreationAction>;
+  #actions: PendingActionStore<DriveAction>;
 
   constructor(private storage: DriveCreationStorage) {
     this.#actions = new PendingActionStore(storage);
@@ -79,12 +109,53 @@ export class DriveCreationStore {
     return this.#actions.submit(action);
   }
 
+  submitDocEdit(action: DriveDocEditAction): number {
+    return this.#actions.submit(action);
+  }
+
   pendingCount(): number {
-    return this.#actions.list().length;
+    return this.#actions.list().filter(({ action }) => action.actionType === "create").length;
+  }
+
+  getDriveAction(id: number): DriveAction | undefined {
+    return this.#actions.get(id);
   }
 
   getAction(id: number): DriveCreationAction | undefined {
-    return this.#actions.get(id);
+    const action = this.#actions.get(id);
+    return action?.actionType === "create" ? action : undefined;
+  }
+
+  getDocEdit(id: number): DriveDocEditAction | undefined {
+    const action = this.#actions.get(id);
+    return action?.actionType === "docEdit" ? action : undefined;
+  }
+
+  isDocEdit(id: number): boolean {
+    const outcome = this.#storedOutcome(id);
+    return this.getDocEdit(id) !== undefined ||
+      (outcome !== undefined && "actionType" in outcome);
+  }
+
+  listDocEdits(driveCreationId: number): { id: number; action: DriveDocEditAction }[] {
+    return this.#actions.list().flatMap(({ id, action }) =>
+      action.actionType === "docEdit" && action.driveCreationId === driveCreationId
+        ? [{ id, action }]
+        : []);
+  }
+
+  invalidateDocEdits(driveCreationId: number, reason: string): void {
+    for (const { id, action } of this.listDocEdits(driveCreationId)) {
+      if (!action.invalidatedReason) this.putDocEdit(id, { ...action, invalidatedReason: reason });
+    }
+  }
+
+  docEdits(driveCreationId: number): DriveDocEditStore {
+    return new DriveDocEditStore(this, driveCreationId);
+  }
+
+  putDocEdit(id: number, action: DriveDocEditAction): void {
+    this.#actions.put(id, action);
   }
 
   removeAction(id: number): void {
@@ -92,7 +163,8 @@ export class DriveCreationStore {
   }
 
   getOutcome(id: number): StoredDriveCreationOutcome | undefined {
-    return this.storage.get<StoredOutcomeRecord>(this.#outcomeKey(id))?.outcome;
+    const outcome = this.#storedOutcome(id);
+    return outcome && !("actionType" in outcome) ? outcome : undefined;
   }
 
   putApplying(id: number, createdFileId?: string): void {
@@ -113,6 +185,12 @@ export class DriveCreationStore {
     this.#pruneTerminalOutcomes();
   }
 
+  finishDocEdit(id: number): void {
+    this.#putOutcome(id, { actionType: "docEdit" });
+    this.removeAction(id);
+    this.#pruneTerminalOutcomes();
+  }
+
   cleanupTerminal(id: number): void {
     this.removeAction(id);
     this.#pruneTerminalOutcomes();
@@ -122,22 +200,60 @@ export class DriveCreationStore {
     return `${OUTCOME_PREFIX}${id}`;
   }
 
-  #putOutcome(id: number, outcome: StoredDriveCreationOutcome): void {
+  #storedOutcome(id: number): StoredOutcomeRecord["outcome"] | undefined {
+    return this.storage.get<StoredOutcomeRecord>(this.#outcomeKey(id))?.outcome;
+  }
+
+  #putOutcome(id: number, outcome: StoredOutcomeRecord["outcome"]): void {
     let sequence = this.storage.get<number>(NEXT_OUTCOME_SEQUENCE_KEY) ?? 1;
     this.storage.put(NEXT_OUTCOME_SEQUENCE_KEY, sequence + 1);
     this.storage.put(this.#outcomeKey(id), { sequence, outcome } satisfies StoredOutcomeRecord);
   }
 
   #pruneTerminalOutcomes(): void {
-    let terminal = [...this.storage.list<StoredOutcomeRecord>({ prefix: OUTCOME_PREFIX })]
-      .map(([key, record]) => ({
-        id: Number(key.slice(OUTCOME_PREFIX.length)), key, sequence: record.sequence,
+    const retainedCreationIds = new Set(this.#actions.list().map(({ id, action }) =>
+      action.actionType === "create" ? id : action.driveCreationId));
+    let prunable = [...this.storage.list<StoredOutcomeRecord>({ prefix: OUTCOME_PREFIX })]
+      .map(([key, { sequence, outcome }]) => ({
+        id: Number(key.slice(OUTCOME_PREFIX.length)), key, sequence, outcome,
       }))
-      .filter(({ id }) => Number.isFinite(id) && this.getAction(id) === undefined)
+      .filter(({ id, outcome }) => {
+        if (!Number.isFinite(id) || retainedCreationIds.has(id)) return false;
+        return "actionType" in outcome ||
+          outcome.status !== "created" || outcome.kind !== "googleDoc";
+      })
       .toSorted((a, b) => a.sequence - b.sequence);
-    for (let record of terminal.slice(0, -MAX_TERMINAL_OUTCOMES)) {
+    for (let record of prunable.slice(0, -MAX_TERMINAL_OUTCOMES)) {
       this.storage.delete(record.key);
     }
+  }
+}
+
+/** Pending-action adapter restricted to one logical Drive-created Doc. */
+export class DriveDocEditStore {
+  constructor(
+    private store: DriveCreationStore,
+    private driveCreationId: number,
+  ) {}
+
+  get(id: number): DriveDocEditAction | undefined {
+    const action = this.store.getDocEdit(id);
+    return action?.driveCreationId === this.driveCreationId ? action : undefined;
+  }
+
+  list(): { id: number; action: DriveDocEditAction }[] {
+    return this.store.listDocEdits(this.driveCreationId);
+  }
+
+  put(id: number, action: DriveDocEditAction): void {
+    if (action.driveCreationId !== this.driveCreationId || !this.get(id)) {
+      throw new Error(`Unknown pending Google Drive Doc edit: ${id}`);
+    }
+    this.store.putDocEdit(id, action);
+  }
+
+  remove(id: number): void {
+    if (this.get(id)) this.store.removeAction(id);
   }
 }
 
@@ -156,22 +272,24 @@ export function assertDriveCreationCapacity(storage: DriveCreationStorage): void
 }
 
 /** Persist one request and submit its manual approval description. */
-export async function submitDriveCreation(options: {
+export async function submitDriveCreation<Kind extends DriveCreationKind>(options: {
   storage: DriveCreationStorage;
   approvalQueue: Pick<ApprovalQueue, "submitAction">;
-  kind: DriveCreationKind;
+  kind: Kind;
   name: string;
   parent: DriveCreationParent;
   requestId?: string;
-}): Promise<DriveCreationHandle> {
+}): Promise<DriveCreationHandle<Kind>> {
   validateDriveCreationName(options.name);
   assertDriveCreationCapacity(options.storage);
   let action: DriveCreationAction = {
+    actionType: "create",
     kind: options.kind,
     name: options.name,
     parentId: options.parent.id,
     parentAuthority: options.parent.authority,
     requestId: options.requestId ?? crypto.randomUUID(),
+    submittedAt: Date.now(),
   };
   let store = new DriveCreationStore(options.storage);
   let id = store.submit(action);
@@ -186,13 +304,15 @@ export async function submitDriveCreation(options: {
         formatApprovalField("Destination folder ID", options.parent.id),
       ].join("\n\n"),
       implementsRevert: true,
-      awaitDecision: true,
+      ...(action.kind === "googleDoc"
+        ? { actionKind: CREATE_GOOGLE_DOC_ACTION, autoApprovable: true }
+        : { awaitDecision: true }),
     });
   } catch (error) {
     store.removeAction(id);
     throw error;
   }
-  return { id, kind: action.kind, name: action.name };
+  return { id, kind: options.kind, name: action.name };
 }
 
 /** Provider and durable state required by Drive creation callbacks. */
@@ -212,6 +332,9 @@ export function readDriveCreationState(
     return { status: "pending", lastError: outcome.message };
   }
   if (outcome?.status === "applying") return { status: "pending" };
+  if (outcome?.status === "created") {
+    return { status: "created", kind: outcome.kind, fileId: outcome.fileId };
+  }
   if (outcome) return outcome;
   if (store.getAction(actionId)) return { status: "pending" };
   throw new Error(`Unknown Google Drive creation action: ${actionId}`);
@@ -267,29 +390,32 @@ export async function applyDriveCreation(
     throw error;
   }
 
-  store.finish(actionId, { status: "created", kind: action.kind, fileId: created.id });
+  store.finish(actionId, {
+    status: "created", kind: action.kind, fileId: created.id, requestId: action.requestId,
+  });
 }
 
 /** Serialize callbacks for each action while retaining crash recovery in durable state. */
 export class DriveCreationCoordinator {
-  #inFlight = new Map<number, Promise<void>>();
+  #inFlight = new Map<number, Promise<unknown>>();
 
   /** Apply one approved creation after any earlier callback for the same action. */
   apply(runtime: DriveCreationRuntime, actionId: number): Promise<void> {
-    return this.#run(actionId, () => applyDriveCreation(runtime, actionId));
+    return this.run(actionId, () => applyDriveCreation(runtime, actionId));
   }
 
   /** Reject one creation after any earlier callback for the same action. */
-  reject(runtime: DriveCreationRuntime, actionId: number): Promise<void> {
-    return this.#run(actionId, () => rejectDriveCreation(runtime, actionId));
+  reject(runtime: DriveCreationRuntime, actionId: number): Promise<boolean> {
+    return this.run(actionId, () => rejectDriveCreation(runtime, actionId));
   }
 
   /** Revert one creation after any earlier callback for the same action. */
-  revert(runtime: DriveCreationRuntime, actionId: number): Promise<void> {
-    return this.#run(actionId, () => revertDriveCreation(runtime, actionId));
+  revert(runtime: DriveCreationRuntime, actionId: number): Promise<boolean> {
+    return this.run(actionId, () => revertDriveCreation(runtime, actionId));
   }
 
-  #run(actionId: number, operation: () => Promise<void>): Promise<void> {
+  /** Serialize any lifecycle callback after an earlier callback for the same action ID. */
+  run<T>(actionId: number, operation: () => Promise<T>): Promise<T> {
     let previous = this.#inFlight.get(actionId) ?? Promise.resolve();
     let current = previous.catch(() => {}).then(operation).finally(() => {
       if (this.#inFlight.get(actionId) === current) this.#inFlight.delete(actionId);
@@ -302,13 +428,13 @@ export class DriveCreationCoordinator {
 /** Reject pending creation, first removing any file produced by a failed attempt. */
 export async function rejectDriveCreation(
   runtime: DriveCreationRuntime, actionId: number,
-): Promise<void> {
+): Promise<boolean> {
   let store = new DriveCreationStore(runtime.storage);
   let action = store.getAction(actionId);
   let outcome = store.getOutcome(actionId);
   if (outcome?.status === "rejected") {
     store.cleanupTerminal(actionId);
-    return;
+    return store.listDocEdits(actionId).length > 0;
   }
   if (outcome?.status === "created" || outcome?.status === "reverted") {
     throw new Error(`Google Drive creation action ${actionId} has already been applied`);
@@ -326,18 +452,22 @@ export async function rejectDriveCreation(
     }
   }
   if (createdFileId) await trashCreatedFile(runtime, createdFileId);
+  store.invalidateDocEdits(
+    actionId, `Google Drive creation action ${actionId} was rejected.`);
+  let restart = store.listDocEdits(actionId).length > 0;
   store.finish(actionId, { status: "rejected" });
+  return restart;
 }
 
 /** Trash a currently authorized created item and record its reverted state. */
 export async function revertDriveCreation(
   runtime: DriveCreationRuntime, actionId: number,
-): Promise<void> {
+): Promise<boolean> {
   let store = new DriveCreationStore(runtime.storage);
   let outcome = store.getOutcome(actionId);
   if (outcome?.status === "reverted") {
     store.cleanupTerminal(actionId);
-    return;
+    return store.listDocEdits(actionId).length > 0;
   }
   let fileId: string | undefined;
   if (outcome?.status === "created") fileId = outcome.fileId;
@@ -346,7 +476,11 @@ export async function revertDriveCreation(
     throw new Error(`Google Drive creation action ${actionId} cannot be reverted`);
   }
   await trashCreatedFile(runtime, fileId);
+  store.invalidateDocEdits(
+    actionId, `Google Drive creation action ${actionId} was reverted.`);
+  let restart = store.listDocEdits(actionId).length > 0;
   store.finish(actionId, { status: "reverted" });
+  return restart;
 }
 
 async function trashCreatedFile(runtime: DriveCreationRuntime, fileId: string): Promise<void> {

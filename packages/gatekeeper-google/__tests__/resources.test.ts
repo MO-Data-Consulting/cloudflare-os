@@ -38,8 +38,9 @@ describe("resource declarations", () => {
     expect(GOOGLE_DRIVE_RESOURCE.description).toBe(
       "Find files and folders anywhere this Google account can read in Drive, including shared " +
       "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
-      "results contain metadata only, while native Google Docs and Sheets can be opened read-only " +
-      "and blank Docs, Sheets, and folders can be created in writable destinations.",
+      "results contain metadata only, while arbitrary native Google Docs and Sheets open read-only. " +
+      "Blank Docs, Sheets, and folders can be created in writable destinations; Docs created " +
+      "through this binding can be reopened and edited by their creation handle.",
     );
   });
 
@@ -86,9 +87,12 @@ describe("resource declarations", () => {
     ]).toEqual([
       "Find files and folders anywhere this Google account can read in Drive, including shared " +
       "drives. Full-text search examines indexed file content, descriptions, and OCR text; search " +
-      "results contain metadata only, while native Google Docs and Sheets can be opened read-only " +
-      "and blank Docs, Sheets, and folders can be created in writable destinations.",
-      "Find files and folders, read native Google Docs and Sheets, and create blank Docs, Sheets, and folders in one organization-owned shared drive.",
+      "results contain metadata only, while arbitrary native Google Docs and Sheets open read-only. " +
+      "Blank Docs, Sheets, and folders can be created in writable destinations; Docs created " +
+      "through this binding can be reopened and edited by their creation handle.",
+      "Find files and folders, open arbitrary native Google Docs and Sheets read-only, create " +
+      "blank Docs, Sheets, and folders, and edit Docs created through this binding by their " +
+      "creation handle in one organization-owned shared drive.",
       "Read metadata and, for a native Google Doc or Sheet, content from one Drive file.",
     ]);
   });

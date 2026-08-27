@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
+import type { ActionDescription, ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import {
   applyDriveCreation, DriveCreationCoordinator, DriveCreationStore, readDriveCreationState,
   rejectDriveCreation, revertDriveCreation, submitDriveCreation,
@@ -77,11 +77,21 @@ function fakeApi(overrides: Partial<DriveCreationApi> = {}): DriveCreationApi {
 }
 
 const action = {
+  actionType: "create" as const,
   kind: "googleDoc" as const,
   name: "Quarterly plan",
   parentId: "parent-1",
   parentAuthority: "appCreated" as const,
   requestId: REQUEST_ID,
+  submittedAt: 1,
+};
+
+const docEdit = {
+  actionType: "docEdit" as const,
+  driveCreationId: 1,
+  submittedAt: 2,
+  writeId: "223e4567-e89b-42d3-a456-426614174000",
+  edit: { type: "appendText" as const, markdown: "Draft" },
 };
 
 async function submit(
@@ -102,7 +112,7 @@ async function submit(
 }
 
 describe("Drive creation submission", () => {
-  it("returns a handle and fences untrusted names in the manual approval", async () => {
+  it("returns a handle and fences untrusted names in the Doc auto-approval", async () => {
     let storage = new FakeKv();
     let approvalQueue = {
       submitAction: vi.fn(async (..._args: Parameters<ApprovalQueue["submitAction"]>) => {}),
@@ -113,8 +123,9 @@ describe("Drive creation submission", () => {
       id: 1, kind: "googleDoc", name,
     });
     expect(new DriveCreationStore(storage).getAction(1)).toEqual({
-      kind: "googleDoc", name, parentId: "parent-1", parentAuthority: "appCreated",
-      requestId: REQUEST_ID,
+      actionType: "create", kind: "googleDoc", name, parentId: "parent-1",
+      parentAuthority: "appCreated", requestId: REQUEST_ID,
+      submittedAt: expect.any(Number),
     });
     expect(approvalQueue.submitAction).toHaveBeenCalledTimes(1);
     let [id, description] = approvalQueue.submitAction.mock.calls[0]!;
@@ -128,10 +139,26 @@ describe("Drive creation submission", () => {
     expect(description.description).toContain("blank");
     expect(description.description).toContain("inherits the destination folder's permissions");
     expect(description).toEqual(expect.objectContaining({
-      implementsRevert: true, awaitDecision: true,
+      implementsRevert: true,
+      autoApprovable: true,
+      actionKind: { tag: "createGoogleDoc", label: "Google Doc creation" },
     }));
-    expect(description).not.toHaveProperty("actionKind");
+    expect(description).not.toHaveProperty("awaitDecision");
   });
+
+  it.each(["googleSheet", "folder"] as const)(
+    "keeps %s creation on the manual approval path",
+    async kind => {
+      const submitAction = vi.fn(async (_id: number, _description: ActionDescription) => {});
+      await submit(new FakeKv(), { submitAction }, { kind });
+      expect(submitAction.mock.calls[0]![1]).toEqual(expect.objectContaining({
+        implementsRevert: true,
+        awaitDecision: true,
+      }));
+      expect(submitAction.mock.calls[0]![1]).not.toHaveProperty("autoApprovable");
+      expect(submitAction.mock.calls[0]![1]).not.toHaveProperty("actionKind");
+    },
+  );
 
   it("rejects the 101st pending creation without submitting it", async () => {
     let storage = new FakeKv();
@@ -144,6 +171,19 @@ describe("Drive creation submission", () => {
     );
     expect(approvalQueue.submitAction).not.toHaveBeenCalled();
     expect(store.pendingCount()).toBe(100);
+  });
+
+  it("does not count pending Doc edits against the creation quota", async () => {
+    const storage = new FakeKv();
+    const store = new DriveCreationStore(storage);
+    for (let i = 0; i < 100; i++) {
+      store.submitDocEdit({ ...docEdit, driveCreationId: i + 1 });
+    }
+
+    await expect(submit(storage)).resolves.toEqual({
+      id: 101, kind: "googleDoc", name: "Quarterly plan",
+    });
+    expect(store.pendingCount()).toBe(1);
   });
 
   it("removes pending state when approval submission fails", async () => {
@@ -166,9 +206,9 @@ describe("Drive creation action lifecycle", () => {
     let handle = await submit(storage);
     expect(readDriveCreationState(storage, handle.id)).toEqual({ status: "pending" });
 
-    await rejectDriveCreation(
+    await expect(rejectDriveCreation(
       { storage, api: fakeApi(), scope: { kind: "account" } }, handle.id,
-    );
+    )).resolves.toBe(false);
 
     expect(readDriveCreationState(storage, handle.id)).toEqual({ status: "rejected" });
     expect(new DriveCreationStore(storage).getAction(handle.id)).toBeUndefined();
@@ -190,7 +230,9 @@ describe("Drive creation action lifecycle", () => {
     expect(readDriveCreationState(storage, handle.id)).toEqual({
       status: "pending", lastError: "provider unavailable",
     });
-    expect(new DriveCreationStore(storage).getAction(handle.id)).toEqual(action);
+    expect(new DriveCreationStore(storage).getAction(handle.id)).toEqual({
+      ...action, submittedAt: expect.any(Number),
+    });
   });
 
   it("serializes concurrent apply callbacks for one creation", async () => {
@@ -587,11 +629,118 @@ describe("Drive creation action lifecycle", () => {
 
     expect(store.getAction(pendingId)).toEqual(action);
     expect(store.getOutcome(pendingId)).toEqual({ status: "failed", message: "retry me" });
-    expect([...storage.list({ prefix: "drive:create:outcome:" })]).toHaveLength(101);
+    expect([...storage.list({ prefix: "drive:action:outcome:" })]).toHaveLength(101);
     expect([...storage.list({ prefix: "pending:action:" })]).toHaveLength(1);
     expect(() => readDriveCreationState(storage, 2)).toThrow(
       "Unknown Google Drive creation action: 2",
     );
     expect(readDriveCreationState(storage, 102)).toEqual({ status: "rejected" });
+  });
+
+  it("retains created Doc identity while bounding completed edit receipts", () => {
+    const storage = new FakeKv();
+    const store = new DriveCreationStore(storage);
+    const creationId = store.submit(action);
+    store.finish(creationId, {
+      status: "created", kind: "googleDoc", fileId: "created-1", requestId: REQUEST_ID,
+    });
+    const editIds = Array.from({ length: 101 }, () => {
+      const id = store.submitDocEdit({ ...docEdit, driveCreationId: creationId });
+      store.finishDocEdit(id);
+      return id;
+    });
+
+    expect(store.getOutcome(creationId)).toEqual({
+      status: "created", kind: "googleDoc", fileId: "created-1", requestId: REQUEST_ID,
+    });
+    expect(store.isDocEdit(editIds[0]!)).toBe(false);
+    expect(editIds.slice(1).every(id => store.isDocEdit(id))).toBe(true);
+  });
+  it("retains a created outcome while a pending Doc edit references it", () => {
+    const storage = new FakeKv();
+    const store = new DriveCreationStore(storage);
+    const creationId = store.submit(action);
+    store.finish(creationId, {
+      status: "created", kind: "googleDoc", fileId: "created-1", requestId: REQUEST_ID,
+    });
+    store.submitDocEdit(docEdit);
+
+    for (let i = 0; i < 101; i++) {
+      const id = store.submit({ ...action, submittedAt: i + 3 });
+      store.finish(id, { status: "rejected" });
+    }
+
+    expect(store.getOutcome(creationId)).toEqual({
+      status: "created", kind: "googleDoc", fileId: "created-1", requestId: REQUEST_ID,
+    });
+    expect(store.getDocEdit(2)).toEqual(docEdit);
+    expect(() => readDriveCreationState(storage, 3)).toThrow(
+      "Unknown Google Drive creation action: 3",
+    );
+  });
+
+  it("retains dependent Doc edits as invalidated when creation is rejected", async () => {
+    const storage = new FakeKv();
+    const store = new DriveCreationStore(storage);
+    const creationId = store.submit(action);
+    const firstEditId = store.submitDocEdit({ ...docEdit, driveCreationId: creationId });
+    const secondEditId = store.submitDocEdit({
+      ...docEdit,
+      driveCreationId: creationId,
+      writeId: "323e4567-e89b-42d3-a456-426614174000",
+    });
+
+    await expect(rejectDriveCreation(
+      { storage, api: fakeApi(), scope: { kind: "account" } }, creationId,
+    )).resolves.toBe(true);
+
+    expect(readDriveCreationState(storage, creationId)).toEqual({ status: "rejected" });
+    for (const editId of [firstEditId, secondEditId]) {
+      expect(store.getDocEdit(editId)).toEqual(expect.objectContaining({
+        invalidatedReason: expect.stringMatching(/creation.*rejected/i),
+      }));
+    }
+  });
+
+  it("requests restart when an edit arrives during rejection", async () => {
+    const storage = new FakeKv();
+    const handle = await submit(storage);
+    const store = new DriveCreationStore(storage);
+    let resolveLookup!: (value: DriveFile | undefined) => void;
+    const api = fakeApi({
+      findFileByCreationRequestId: vi.fn(() =>
+        new Promise<DriveFile | undefined>(resolve => { resolveLookup = resolve; })),
+    });
+    const rejecting = rejectDriveCreation(
+      { storage, api, scope: { kind: "account" } }, handle.id);
+    await vi.waitFor(() => expect(api.findFileByCreationRequestId).toHaveBeenCalledOnce());
+    const editId = store.submitDocEdit({ ...docEdit, driveCreationId: handle.id });
+
+    resolveLookup(undefined);
+
+    await expect(rejecting).resolves.toBe(true);
+    expect(store.getDocEdit(editId)?.invalidatedReason).toMatch(/creation.*rejected/i);
+  });
+
+  it("requests restart when an edit arrives during revert", async () => {
+    const storage = new FakeKv();
+    const handle = await submit(storage);
+    const store = new DriveCreationStore(storage);
+    store.finish(handle.id, {
+      status: "created", kind: "googleDoc", fileId: "created-1", requestId: REQUEST_ID,
+    });
+    let resolveFile!: (value: DriveFile) => void;
+    const api = fakeApi({
+      getFile: vi.fn(() => new Promise<DriveFile>(resolve => { resolveFile = resolve; })),
+    });
+    const reverting = revertDriveCreation(
+      { storage, api, scope: { kind: "account" } }, handle.id);
+    await vi.waitFor(() => expect(api.getFile).toHaveBeenCalledOnce());
+    const editId = store.submitDocEdit({ ...docEdit, driveCreationId: handle.id });
+
+    resolveFile(file());
+
+    await expect(reverting).resolves.toBe(true);
+    expect(store.getDocEdit(editId)?.invalidatedReason).toMatch(/creation.*reverted/i);
   });
 });

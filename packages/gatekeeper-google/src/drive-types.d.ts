@@ -1,4 +1,5 @@
 import type { GoogleDocReadSession } from "./docs-read-types";
+import type { GoogleDocSession } from "./docs-types";
 import type { GoogleSpreadsheetSession } from "./sheets-types";
 
 /**
@@ -133,11 +134,13 @@ export interface DriveCreationOptions {
 }
 
 /** Reference used to query the outcome of an asynchronous Drive creation. */
-export interface DriveCreationHandle {
+export interface DriveCreationHandle<
+  Kind extends DriveCreationKind = DriveCreationKind,
+> {
   /** Sequential action identifier within this binding. */
   id: number;
   /** Requested item kind. */
-  kind: DriveCreationKind;
+  kind: Kind;
   /** Requested item name. */
   name: string;
 }
@@ -207,11 +210,17 @@ export interface GoogleDriveReadSession {
 /** Drive account or shared-drive access, including blank native item creation. */
 export interface GoogleDriveSession extends GoogleDriveReadSession {
   /** Queue creation of a blank native Google Doc. */
-  createGoogleDoc(options: DriveCreationOptions): Promise<DriveCreationHandle>;
+  createGoogleDoc(options: DriveCreationOptions): Promise<DriveCreationHandle<"googleDoc">>;
+  /**
+   * Open the writable Doc created by this binding for a creation handle. The handle is plain data:
+   * persist it between scheduled callbacks, reopen a fresh child in each callback, and dispose the
+   * returned RPC capability when finished. Pending creation and edits are simulated locally.
+   */
+  openCreatedGoogleDoc(handle: DriveCreationHandle<"googleDoc">): Promise<GoogleDocSession>;
   /** Queue creation of a blank native Google Sheet. */
-  createGoogleSheet(options: DriveCreationOptions): Promise<DriveCreationHandle>;
+  createGoogleSheet(options: DriveCreationOptions): Promise<DriveCreationHandle<"googleSheet">>;
   /** Queue creation of a folder. */
-  createFolder(options: DriveCreationOptions): Promise<DriveCreationHandle>;
-  /** Read the current outcome. Old terminal outcomes are retained only within the binding's bounded history. */
+  createFolder(options: DriveCreationOptions): Promise<DriveCreationHandle<"folder">>;
+  /** Read the current outcome. Created Doc identities persist for handles; other old terminal outcomes are bounded. */
   getCreationResult(handle: DriveCreationHandle): Promise<DriveCreationOutcome>;
 }

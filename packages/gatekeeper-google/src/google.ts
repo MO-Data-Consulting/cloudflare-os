@@ -13,10 +13,11 @@ import type {
   GoogleSpreadsheetSession, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
 } from "./sheets-types";
 import { docToMarkdown, markdownToDocRequests, computeReplaceOperations, DocSnapshot } from "./markdown-converter";
-import { DriveApi } from "./drive-api";
+import { DriveApi, hasDriveCreationMarker, type DriveFile } from "./drive-api";
 import { driveObserverTracker } from "./drive-observers";
 import {
-  DriveSessionCore, GOOGLE_DOC_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE, type DriveBindingScope,
+  DriveSessionCore, GOOGLE_DOC_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE, isDriveFileInScope,
+  type DriveBindingScope,
 } from "./drive-session";
 import type {
   DriveCreationHandle, DriveCreationKind, DriveCreationOptions, DriveCreationOutcome, DriveEntry,
@@ -84,8 +85,9 @@ import { CursorPager, Pager } from "./cursor";
 import { formatApprovalField, sanitizeApprovalTitle } from "./approval-format";
 import { PendingActionStore } from "./pending-action-store";
 import {
-  assertDriveCreationCapacity, DriveCreationCoordinator, readDriveCreationState,
-  submitDriveCreation, validateDriveCreationName, type DriveCreationStorage,
+  assertDriveCreationCapacity, CREATE_GOOGLE_DOC_ACTION, DriveCreationCoordinator,
+  DriveCreationStore, readDriveCreationState, submitDriveCreation, validateDriveCreationName,
+  type DriveCreationAction, type DriveCreationStorage, type DriveDocEditAction,
 } from "./drive-creation";
 import {
   decodeGoogleOAuthState,
@@ -127,7 +129,10 @@ function getDriveAgentTypesCode(): string {
 
 function getGoogleDriveTypesCode(): string {
   return googleDriveTypesCode ??= [
-    DOCS_READ_TYPES_CODE, SHEETS_TYPES_CODE, getDriveAgentTypesCode(),
+    DOCS_READ_TYPES_CODE,
+    stripTypeModulePrefix(DOCS_TYPES_CODE, DOCS_TYPES_MODULE_PREFIX),
+    SHEETS_TYPES_CODE,
+    getDriveAgentTypesCode(),
   ].join("\n");
 }
 
@@ -1758,6 +1763,7 @@ type GoogleDocReplaceAction = GoogleDocActionBase & {
 type GoogleDocAppendAction = GoogleDocActionBase & {
   type: "appendText";
   markdown: string;
+  preserveSpacing?: true;
 }
 
 type GoogleDocAction = GoogleDocReplaceAction | GoogleDocAppendAction;
@@ -1821,20 +1827,12 @@ function applyMarkdownReplacement(
 }
 
 function appendMarkdownForSimulation(markdown: string, appendedMarkdown: string): string {
-  let normalizedAppend = appendedMarkdown.endsWith("\n") ? appendedMarkdown : appendedMarkdown + "\n";
-
-  if (markdown.length === 0) {
-    return normalizedAppend;
-  }
-
-  if (markdown.endsWith("\n\n")) {
-    return markdown + normalizedAppend;
-  }
-
-  if (markdown.endsWith("\n")) {
-    return markdown + "\n" + normalizedAppend;
-  }
-
+  let normalizedAppend = appendedMarkdown.endsWith("\n")
+    ? appendedMarkdown
+    : appendedMarkdown + "\n";
+  if (markdown.length === 0) return normalizedAppend;
+  if (markdown.endsWith("\n\n")) return markdown + normalizedAppend;
+  if (markdown.endsWith("\n")) return markdown + "\n" + normalizedAppend;
   return markdown + "\n\n" + normalizedAppend;
 }
 
@@ -1848,7 +1846,9 @@ function applyGoogleDocActionToMarkdown(markdown: string, action: GoogleDocActio
       return applyMarkdownReplacement(
           markdown, action.oldMarkdown, action.newMarkdown, "replaceText");
     case "appendText":
-      return appendMarkdownForSimulation(markdown, action.markdown);
+      return action.preserveSpacing
+        ? markdown + action.markdown
+        : appendMarkdownForSimulation(markdown, action.markdown);
     default:
       action satisfies never;
       throw new Error(`unknown action type: ${(action as any).type}`);
@@ -1860,7 +1860,7 @@ function errorMessage(error: unknown): string {
 }
 
 function invalidateGoogleDocAction(
-  pendingActions: PendingActionStore<GoogleDocAction>,
+  pendingActions: Pick<PendingActionStore<GoogleDocAction>, "put">,
   pending: GoogleDocPendingAction,
   reason: string,
 ): void {
@@ -1871,7 +1871,7 @@ function invalidateGoogleDocAction(
 }
 
 function invalidateUnreplayableGoogleDocActions(
-  pendingActions: PendingActionStore<GoogleDocAction>,
+  pendingActions: Pick<PendingActionStore<GoogleDocAction>, "put">,
   baseMarkdown: string,
   pending: GoogleDocPendingAction[],
   context: string,
@@ -1920,7 +1920,8 @@ function materializeGoogleDocAction(snapshot: DocSnapshot, action: GoogleDocActi
 
     case "appendText": {
       let insertAt = snapshot.bodyEndIndex - 1;
-      return markdownToDocRequests("\n" + action.markdown, insertAt);
+      let markdown = action.preserveSpacing ? action.markdown : "\n" + action.markdown;
+      return markdownToDocRequests(markdown, insertAt);
     }
 
     default:
@@ -2969,6 +2970,228 @@ class GoogleCalendarSessionImpl extends RpcTarget implements GoogleCalendarSessi
 // Google Drive Gatekeeper
 // =======================================================================================
 
+type DriveCreatedDocumentState =
+  | { status: "pending"; action: DriveCreationAction }
+  | { status: "created"; fileId: string; requestId: string };
+
+function resolveDriveCreatedDocument(
+  storage: DriveCreationStorage, creationId: number,
+): DriveCreatedDocumentState {
+  let store = new DriveCreationStore(storage);
+  let outcome = store.getOutcome(creationId);
+  if (outcome?.status === "created") {
+    if (outcome.kind !== "googleDoc") {
+      throw new Error(`Google Drive creation action #${creationId} is not a Google Doc.`);
+    }
+    return { status: "created", fileId: outcome.fileId, requestId: outcome.requestId };
+  }
+  if (outcome?.status === "rejected" || outcome?.status === "reverted") {
+    throw new Error(`Google Drive creation action #${creationId} was ${outcome.status}.`);
+  }
+
+  let stored = store.getAction(creationId);
+  if (!stored || stored.actionType !== "create") {
+    throw new Error(`Unknown Google Drive creation action #${creationId}.`);
+  }
+  let action = stored;
+  if (action.kind !== "googleDoc") {
+    throw new Error(`Google Drive creation action #${creationId} is not a Google Doc.`);
+  }
+  return { status: "pending", action };
+}
+
+function driveDocAction(
+  action: DriveDocEditAction, documentId: string, baseRevisionId: string,
+): GoogleDocAction {
+  return {
+    documentId,
+    baseRevisionId,
+    submittedAt: action.submittedAt,
+    writeId: action.writeId,
+    ...(action.invalidatedReason ? { invalidatedReason: action.invalidatedReason } : {}),
+    ...action.edit,
+    ...(action.edit.type === "appendText" ? { preserveSpacing: true as const } : {}),
+  };
+}
+
+function replayDriveDocEdits(
+  storage: DriveCreationStorage, creationId: number, documentId: string, snapshot: DocSnapshot,
+): string {
+  let edits = new DriveCreationStore(storage).docEdits(creationId);
+  let pending = edits.list().map(({ id, action }) => ({
+    id, action: driveDocAction(action, documentId, snapshot.revisionId),
+  }));
+  return invalidateUnreplayableGoogleDocActions(
+    {
+      put(id, action) {
+        let stored = edits.get(id);
+        if (stored && action.invalidatedReason) {
+          edits.put(id, { ...stored, invalidatedReason: action.invalidatedReason });
+        }
+      },
+    },
+    snapshot.markdown,
+    pending,
+    "Pending app-created Google Doc edit could not be replayed",
+  ).markdown;
+}
+
+function validateDriveCreatedGoogleDocFile(
+  scope: DriveBindingScope, file: DriveFile, fileId: string, requestId: string,
+): void {
+  if (file.id !== fileId || !isDriveFileInScope(scope, file)) {
+    throw new Error("The requested file is outside this Drive binding.");
+  }
+  if (file.mimeType !== GOOGLE_DOC_MIME_TYPE) {
+    throw new Error("The created Drive file is not a Google Doc.");
+  }
+  if (file.trashed !== false) throw new Error("The created Google Doc is trashed.");
+  if (!hasDriveCreationMarker(file, requestId)) {
+    throw new Error("The created Google Doc no longer has this creation request marker.");
+  }
+}
+
+function driveCreatedDocSnapshot(doc: Parameters<typeof docToMarkdown>[0]): DocSnapshot {
+  let snapshot = docToMarkdown(doc);
+  return { ...snapshot, markdown: snapshot.markdown.replace(/\n$/, "") };
+}
+
+/** Provider APIs and durable state required to apply one Drive-created Doc edit. */
+export type DriveDocEditRuntime = {
+  storage: DriveCreationStorage;
+  driveApi: DriveApi;
+  docsApi: GoogleDocsApi;
+  scope: DriveBindingScope;
+};
+
+/** Apply one approved Drive-created Doc edit, recovering by its provider-side write marker. */
+export async function applyDriveDocEdit(
+  runtime: DriveDocEditRuntime, actionId: number,
+): Promise<void> {
+  let store = new DriveCreationStore(runtime.storage);
+  let action = store.getDocEdit(actionId);
+  if (!action) {
+    if (store.isDocEdit(actionId)) return;
+    throw new Error(`Unknown pending Drive Doc edit: ${actionId}`);
+  }
+  if (action.invalidatedReason) {
+    store.finishDocEdit(actionId);
+    return;
+  }
+
+  let pending = store.listDocEdits(action.driveCreationId);
+  let firstActive = pending.find(record => !record.action.invalidatedReason);
+  if (firstActive?.id !== actionId) {
+    throw new Error(
+      `Drive-created Doc edits must be approved in order. Approve earlier edit ` +
+      `${firstActive?.id} before edit ${actionId}.`,
+    );
+  }
+
+  let outcome = store.getOutcome(action.driveCreationId);
+  if (outcome?.status !== "created" || outcome.kind !== "googleDoc") {
+    throw new Error(
+      `Google Drive creation action ${action.driveCreationId} must be applied first before its edits.`,
+    );
+  }
+  let file = await runtime.driveApi.getFile(outcome.fileId);
+  validateDriveCreatedGoogleDocFile(runtime.scope, file, outcome.fileId, outcome.requestId);
+
+  let doc = await runtime.docsApi.getDocument(file.id);
+  let snapshot = driveCreatedDocSnapshot(doc);
+  let markerName = `gadgets-write-${action.writeId}`;
+  let requests: any[] = [];
+  if (!Object.hasOwn(doc.namedRanges, markerName)) {
+    try {
+      requests = materializeGoogleDocAction(
+        snapshot, driveDocAction(action, file.id, snapshot.revisionId));
+    } catch (error) {
+      logger.error("dropping stale Drive-created Google Doc edit during apply", {
+        event: "google.drive.doc-edit.apply.stale.dropped", actionId, error,
+      });
+      store.finishDocEdit(actionId);
+      replayDriveDocEdits(runtime.storage, action.driveCreationId, file.id, snapshot);
+      return;
+    }
+    if (requests.length > 0) {
+      await runtime.docsApi.batchUpdate(file.id, requests, snapshot.revisionId, {
+        name: markerName,
+        rangeStart: snapshot.bodyEndIndex - 1,
+      });
+    }
+  }
+
+  store.finishDocEdit(actionId);
+  try {
+    if (requests.length > 0) {
+      snapshot = driveCreatedDocSnapshot(await runtime.docsApi.getDocument(file.id));
+    }
+    replayDriveDocEdits(runtime.storage, action.driveCreationId, file.id, snapshot);
+  } catch (error) {
+    logger.warn("failed to refresh Drive-created Google Doc simulation after applying edit", {
+      event: "google.drive.doc-edit.simulation.refresh.failed", actionId, error,
+    });
+  }
+}
+
+/** Reject one Drive-created Doc edit and rebuild all surviving dependent edits. */
+export async function rejectDriveDocEdit(
+  runtime: DriveDocEditRuntime, actionId: number,
+): Promise<boolean> {
+  let store = new DriveCreationStore(runtime.storage);
+  let action = store.getDocEdit(actionId);
+  if (!action) {
+    if (store.isDocEdit(actionId)) return false;
+    throw new Error(`Unknown pending Drive Doc edit: ${actionId}`);
+  }
+  let hasLaterEdits = store.listDocEdits(action.driveCreationId)
+    .some(record => record.id > actionId);
+  store.finishDocEdit(actionId);
+  let restart = !action.invalidatedReason && hasLaterEdits;
+  if (!restart) return false;
+
+  try {
+    let outcome = store.getOutcome(action.driveCreationId);
+    if (outcome?.status === "rejected" || outcome?.status === "reverted") {
+      store.invalidateDocEdits(
+        action.driveCreationId,
+        `Google Drive creation action ${action.driveCreationId} was ${outcome.status}.`,
+      );
+      return restart;
+    }
+
+    let documentId = "";
+    let snapshot: DocSnapshot;
+    if (outcome?.status === "created" && outcome.kind === "googleDoc") {
+      let file = await runtime.driveApi.getFile(outcome.fileId);
+      validateDriveCreatedGoogleDocFile(
+        runtime.scope, file, outcome.fileId, outcome.requestId);
+      documentId = file.id;
+      snapshot = driveCreatedDocSnapshot(await runtime.docsApi.getDocument(file.id));
+    } else {
+      let creation = store.getAction(action.driveCreationId);
+      if (!creation || creation.kind !== "googleDoc") {
+        throw new Error(`Unknown Google Drive creation action: ${action.driveCreationId}`);
+      }
+      snapshot = {
+        title: creation.name,
+        revisionId: `pending:${action.driveCreationId}`,
+        markdown: "",
+        sourceMap: { blocks: [] },
+        fetchedAt: creation.submittedAt,
+        bodyEndIndex: 1,
+      };
+    }
+    replayDriveDocEdits(
+      runtime.storage, action.driveCreationId, documentId, snapshot);
+  } catch (error) {
+    logger.warn("failed to rebuild Drive-created Google Doc simulation after rejecting edit", {
+      event: "google.drive.doc-edit.simulation.reject-rebuild.failed", actionId, error,
+    });
+  }
+  return restart;
+}
+
 type GoogleDriveGatekeeperImplProps = {
   userObjectId: string;
   scope: DriveBindingScope;
@@ -3006,7 +3229,7 @@ export class GoogleDriveGatekeeperImpl
       return {
         url: `https://drive.google.com/drive/folders/${encodeURIComponent(scope.driveId)}`,
         title: drive.name,
-        snippet: `Find files and folders, read native Google Docs and Sheets, and create blank Docs, Sheets, and folders in organization-owned shared drive "${drive.name}"`,
+        snippet: `Find files and folders, open arbitrary native Google Docs and Sheets read-only, create blank Docs, Sheets, and folders, and edit Docs created through this binding by their creation handle in organization-owned shared drive "${drive.name}"`,
         suggestedBindingName: "GOOGLE_SHARED_DRIVE",
         tsType: "GoogleDriveSession",
       };
@@ -3025,8 +3248,10 @@ export class GoogleDriveGatekeeperImpl
     return getGoogleDriveTypesCode();
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return this.ctx.props.scope.kind === "file"
+      ? []
+      : [CREATE_GOOGLE_DOC_ACTION, EDIT_DOCUMENT_ACTION];
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<GoogleDriveSession> {
@@ -3044,16 +3269,33 @@ export class GoogleDriveGatekeeperImpl
     );
   }
 
-  async applyAction(action: number): Promise<void> {
-    await this.#creationCoordinator.apply(this.#creationRuntime(), action);
+  async applyAction(actionId: number): Promise<void> {
+    let store = new DriveCreationStore(this.ctx.storage.kv);
+    if (store.isDocEdit(actionId)) {
+      await this.#creationCoordinator.run(
+        actionId, () => applyDriveDocEdit(this.#docEditRuntime(), actionId));
+      return;
+    }
+    await this.#creationCoordinator.apply(this.#creationRuntime(), actionId);
   }
 
-  async rejectAction(action: number): Promise<void> {
-    await this.#creationCoordinator.reject(this.#creationRuntime(), action);
+  async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
+    let store = new DriveCreationStore(this.ctx.storage.kv);
+    let restart = store.isDocEdit(actionId)
+      ? await this.#creationCoordinator.run(
+          actionId, () => rejectDriveDocEdit(this.#docEditRuntime(), actionId))
+      : await this.#creationCoordinator.reject(this.#creationRuntime(), actionId);
+    return restart ? { restart: true } : undefined;
   }
 
-  async revertAction(action: number): Promise<void> {
-    await this.#creationCoordinator.revert(this.#creationRuntime(), action);
+  async revertAction(actionId: number):
+      Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
+    let store = new DriveCreationStore(this.ctx.storage.kv);
+    let restart = store.isDocEdit(actionId)
+      ? await this.#creationCoordinator.run(
+          actionId, () => rejectDriveDocEdit(this.#docEditRuntime(), actionId))
+      : await this.#creationCoordinator.revert(this.#creationRuntime(), actionId);
+    return restart ? { restart: true } : undefined;
   }
 
   #creationRuntime() {
@@ -3064,6 +3306,15 @@ export class GoogleDriveGatekeeperImpl
     };
   }
 
+  #docEditRuntime(): DriveDocEditRuntime {
+    let getDriveAccessToken = (opts?: AccessTokenRequest) => this.#getAccessToken(opts);
+    return {
+      storage: this.ctx.storage.kv,
+      driveApi: new DriveApi(getDriveAccessToken),
+      docsApi: new GoogleDocsApi(getDriveAccessToken),
+      scope: this.ctx.props.scope,
+    };
+  }
   #observerTracker(): ObserverTracker<string, Fetcher<GoogleVerifierApi>> {
     return driveObserverTracker<Fetcher<GoogleVerifierApi>>(
       this.ctx.storage.kv, this.ctx.props.scope,
@@ -3126,6 +3377,155 @@ class GoogleDocReadSessionImpl extends RpcTarget implements GoogleDocReadSession
   }
 }
 
+@validateRpc()
+class DriveCreatedGoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
+  #core: DriveSessionCore;
+
+  constructor(
+    driveApi: DriveApi,
+    private docsApi: GoogleDocsApi,
+    private scope: DriveBindingScope,
+    private storage: DriveCreationStorage,
+    private approvalQueue: RpcStub<ApprovalQueue>,
+    prepareObservation: (fileIds: string[]) => Promise<ObserverCheck<string>>,
+    observerIds: () => string[],
+    private creationId: number,
+  ) {
+    super();
+    this.#core = new DriveSessionCore({
+      api: driveApi,
+      scope,
+      prepareObservation,
+      observerIds,
+      authorize: description => this.approvalQueue.authorizeObservation(description),
+    });
+  }
+
+  [Symbol.dispose](): void {
+    this.approvalQueue[Symbol.dispose]();
+  }
+
+  async #providerFile(state: DriveCreatedDocumentState): Promise<DriveFile | undefined> {
+    if (state.status === "pending") return undefined;
+    let file = await this.#core.inspectCreatedFile(state.fileId);
+    validateDriveCreatedGoogleDocFile(
+      this.scope, file, state.fileId, state.requestId);
+    return file;
+  }
+
+  async #snapshot(): Promise<{ snapshot: DocSnapshot; pending: boolean }> {
+    let state = resolveDriveCreatedDocument(this.storage, this.creationId);
+    let file = await this.#providerFile(state);
+    let snapshot = state.status === "pending"
+      ? {
+          title: state.action.name,
+          revisionId: `pending:${this.creationId}`,
+          markdown: "",
+          sourceMap: { blocks: [] },
+          fetchedAt: state.action.submittedAt,
+          bodyEndIndex: 1,
+        }
+      : driveCreatedDocSnapshot(await this.docsApi.getDocument(file!.id));
+    if (state.status === "created") {
+      await this.#authorizeRead(
+        "Read app-created Google Doc content",
+        "Read the current document body as Markdown.",
+      );
+    }
+    let markdown = replayDriveDocEdits(
+      this.storage, this.creationId, file?.id ?? "", snapshot);
+    return { snapshot: { ...snapshot, markdown }, pending: state.status === "pending" };
+  }
+
+  async #authorizeRead(title: string, description: string): Promise<void> {
+    await this.approvalQueue.authorizeObservation({ title, description });
+  }
+
+  async getMetadata(): Promise<DocMetadata> {
+    let state = resolveDriveCreatedDocument(this.storage, this.creationId);
+    let file = await this.#providerFile(state);
+    let edits = new DriveCreationStore(this.storage).listDocEdits(this.creationId);
+    let title: string;
+    let modifiedAt: number;
+    if (state.status === "pending") {
+      await this.#authorizeRead(
+        "Read app-created Google Doc metadata",
+        "Read the simulated title and modification time of a pending Google Doc.",
+      );
+      title = state.action.name;
+      modifiedAt = state.action.submittedAt;
+    } else {
+      title = file!.name;
+      modifiedAt = new Date(file!.modifiedTime ?? "").valueOf();
+      if (Number.isNaN(modifiedAt)) {
+        throw new Error("Google Drive returned an invalid modifiedTime");
+      }
+    }
+    modifiedAt = edits.reduce((latest, { action }) => action.invalidatedReason
+      ? latest
+      : Math.max(latest, action.submittedAt), modifiedAt);
+    return { title, lastModified: new Date(modifiedAt) };
+  }
+
+  async getContent(): Promise<string> {
+    let { snapshot, pending } = await this.#snapshot();
+    if (pending) {
+      await this.#authorizeRead(
+        "Read app-created Google Doc content",
+        "Read the current simulated document body as Markdown.",
+      );
+    }
+    return snapshot.markdown;
+  }
+
+  async replaceText(oldMarkdown: string, newMarkdown: string): Promise<void> {
+    if (oldMarkdown === newMarkdown) return;
+    let { snapshot } = await this.#snapshot();
+    findUniqueMarkdown(snapshot.markdown, oldMarkdown, "replaceText");
+    await this.#submitEdit(
+      { type: "replaceText", oldMarkdown, newMarkdown },
+      "Edit app-created Google Doc",
+      `Replace text in the app-created document.\n\n` +
+        `**Old:** ${previewMarkdown(oldMarkdown, 80)}\n\n` +
+        `**New:** ${previewMarkdown(newMarkdown, 80)}`,
+    );
+  }
+
+  async appendText(markdown: string): Promise<void> {
+    await this.#snapshot();
+    await this.#submitEdit(
+      { type: "appendText", markdown },
+      "Append to app-created Google Doc",
+      `Append content to the app-created document:\n\n${previewMarkdown(markdown, 100)}`,
+    );
+  }
+
+  async #submitEdit(
+    edit: DriveDocEditAction["edit"], title: string, description: string,
+  ): Promise<void> {
+    resolveDriveCreatedDocument(this.storage, this.creationId);
+    let store = new DriveCreationStore(this.storage);
+    let actionId = store.submitDocEdit({
+      actionType: "docEdit",
+      driveCreationId: this.creationId,
+      submittedAt: Date.now(),
+      writeId: crypto.randomUUID(),
+      edit,
+    });
+    try {
+      await this.approvalQueue.submitAction(actionId, {
+        title: sanitizeApprovalTitle(title),
+        description,
+        implementsRevert: false,
+        actionKind: EDIT_DOCUMENT_ACTION,
+        autoApprovable: true,
+      });
+    } catch (error) {
+      store.removeAction(actionId);
+      throw error;
+    }
+  }
+}
 /** Drive RPC session implementation, exported for workerd contract coverage. */
 @validateRpc()
 export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSession {
@@ -3136,7 +3536,8 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
   #approvalQueue: RpcStub<ApprovalQueue>;
   #scope: DriveBindingScope;
   #storage: DriveCreationStorage;
-
+  #prepareObservation: (fileIds: string[]) => Promise<ObserverCheck<string>>;
+  #observerIds: () => string[];
   constructor(
     driveApi: DriveApi,
     docsApi: GoogleDocsApi,
@@ -3154,6 +3555,8 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
     this.#scope = scope;
     this.#storage = storage;
     this.#approvalQueue = approvalQueue;
+    this.#prepareObservation = prepareObservation;
+    this.#observerIds = observerIds;
     this.#core = new DriveSessionCore({
       api: driveApi,
       scope,
@@ -3183,15 +3586,34 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
     return this.#core.getEntry(fileId);
   }
 
-  createGoogleDoc(options: DriveCreationOptions): Promise<DriveCreationHandle> {
+  createGoogleDoc(options: DriveCreationOptions): Promise<DriveCreationHandle<"googleDoc">> {
     return this.#submitCreation("googleDoc", options);
   }
 
-  createGoogleSheet(options: DriveCreationOptions): Promise<DriveCreationHandle> {
+  async openCreatedGoogleDoc(
+    handle: DriveCreationHandle<"googleDoc">,
+  ): Promise<GoogleDocSession> {
+    if (this.#scope.kind === "file") {
+      throw new Error("The requested file is outside this Drive binding.");
+    }
+    resolveDriveCreatedDocument(this.#storage, handle.id);
+    return new DriveCreatedGoogleDocSessionImpl(
+      this.#driveApi,
+      this.#docsApi,
+      this.#scope,
+      this.#storage,
+      this.#approvalQueue.dup(),
+      this.#prepareObservation,
+      this.#observerIds,
+      handle.id,
+    );
+  }
+
+  createGoogleSheet(options: DriveCreationOptions): Promise<DriveCreationHandle<"googleSheet">> {
     return this.#submitCreation("googleSheet", options);
   }
 
-  createFolder(options: DriveCreationOptions): Promise<DriveCreationHandle> {
+  createFolder(options: DriveCreationOptions): Promise<DriveCreationHandle<"folder">> {
     return this.#submitCreation("folder", options);
   }
 
@@ -3211,9 +3633,9 @@ export class GoogleDriveSessionImpl extends RpcTarget implements GoogleDriveSess
     };
   }
 
-  async #submitCreation(
-    kind: DriveCreationKind, options: DriveCreationOptions,
-  ): Promise<DriveCreationHandle> {
+  async #submitCreation<Kind extends DriveCreationKind>(
+    kind: Kind, options: DriveCreationOptions,
+  ): Promise<DriveCreationHandle<Kind>> {
     if (this.#scope.kind === "file") {
       throw new Error("The requested file is outside this Drive binding.");
     }
