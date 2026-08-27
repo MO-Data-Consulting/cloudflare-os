@@ -17,14 +17,14 @@ Supporting cast:
   (`ActionDescription.pushedCommits`, verified and marked at `submitAction`).
 - **GitHub gatekeeper git operations**: enumerate branches/tags, look up commits
   (including truncated ids), enumerate commit histories and PR commits, push commits
-  to a branch, create PRs from pushed commits — every commit-returning observation
-  populating `ObservationDescription.gitCommits`, every push declaring
+  to a branch, create PRs from pushed commits — every returned commit id advertised
+  via `GitCache.advertiseCommit()`, every push declaring
   `ActionDescription.pushedCommits`.
 
 The starting point is the sketch in commit 34ebecd, encompassing changes in
 `workshop-shared/src/gatekeeper.ts` (`GitOid`/`GitObjectType`/`GitCache`/
-`GitPullHints`, `Gatekeeper.gitPull?()`, `ObservationAuthorizer.getGitCache()`,
-`ObservationDescription.gitCommits?`) and `workshop-shared/src/worktree.d.ts` (the
+`GitPullHints`, `Gatekeeper.gitPull?()`, `ObservationAuthorizer.getGitCache()`)
+and `workshop-shared/src/worktree.d.ts` (the
 agent-facing `Worktree` binding API).
 
 ## Locked decisions
@@ -109,8 +109,12 @@ agent-facing `Worktree` binding API).
   Protocol v2, pkt-line composed by hand, `want`s by SHA, **no `have`s ever** —
   an empty have list and an immediate `done` on every fetch (no negotiation; the
   same noop stance git itself takes for partial-clone lazy fetches).
-  Reuse isomorphic-git's packfile parsing (delta resolution) where its internals allow.
-  Packfiles are unpacked wholesale into the `GitCache` and never stored or indexed
+  The gatekeeper handles only protocol framing (pkt-line, sideband demux) and streams
+  the raw pack body into `GitCache.consumePack()` — the pull-side symmetric of
+  `buildPack()` — which unpacks it overseer-side (reusing isomorphic-git's packfile
+  parsing / delta resolution where its internals allow), so no gatekeeper ever
+  re-implements pack decoding. Packfiles are unpacked wholesale into the `GitCache`
+  and never stored or indexed
   long-term: eviction + re-fetch replaces pack-based history storage. The
   no-`have`s rule is correctness, not laziness: a `have` asserts full
   reachability, but every pull here is filtered or tree-limited, so possessing a
@@ -241,8 +245,8 @@ agent-facing `Worktree` binding API).
   (repo-level ACL via `GitHubVerifier.hasRepoAccess`), which covers git data too —
   git objects inherit the repo ACL.
 - Precedent for the protocol work: `gatekeeper-context/src/artifact-sync.ts` proves
-  isomorphic-git 1.40 smart-HTTP fetch works in workerd (we reuse its pack-parsing
-  internals, not its high-level fetch).
+  isomorphic-git 1.40 smart-HTTP fetch works in workerd (`consumePack` reuses its
+  pack-parsing internals, not its high-level fetch).
 
 ## Design
 
@@ -260,6 +264,14 @@ agent-facing `Worktree` binding API).
     a facet-to-parent stub (always local), and callers are free to issue many
     `put()`s in parallel rather than awaiting each serially — doc-comment this on
     `put()`.
+  - `advertiseCommit(commitId)` writes the caller's `pullableFrom` mark (below):
+    the assertion-grade "my remote has this commit; pull it from me on demand".
+    Commits only — trees and blobs enter pull routing implicitly as `put()`
+    referents — and no observation is involved: an advertisement is
+    workspace-internal pull-routing metadata, not a read, and a gatekeeper can
+    already `put()` content with no observation, so the weaker
+    declare-without-providing takes the same path. Same no-batch,
+    parallel-calls stance as `put()`.
   - `get(oid, hints?)` — and `has()`/`stat()` identically; the view is uniform
     across all three — answers **exactly** `onRemote(G) ∪ pendingPush(G)` for
     the calling gatekeeper G, null for everything else. Null is deliberately
@@ -292,6 +304,15 @@ agent-facing `Worktree` binding API).
     facet-to-parent Workers RPC, which carries `ReadableStream` natively; the
     API deliberately leaves room for a future implementation that streams a
     source gatekeeper's pack straight through without staging every object.
+  - `consumePack(pack)` — the pull-side symmetric of `buildPack()`: decodes a
+    standard packfile stream (including ofs/ref delta resolution), stores every
+    contained object, and returns the inserted oids (which a `gitPull`
+    implementation should check its requested oids against). Behaves exactly
+    like the equivalent sequence of `put()`s — same hash verification (so still
+    poison-proof by construction), same `onRemote`/referent metadata recording,
+    same size-cap handling. This is what keeps pack decoding out of individual
+    gatekeepers: `gitPull` strips protocol framing and pipes the pack body here.
+    The pack decoder is hostile-input parsing (see watch-fors).
 - **`gitObjectMetadata` collection**: one row per oid — `{oid, type?, size?,
   onRemote: WorkpieceId[], pullableFrom: WorkpieceId[], pendingPush:
   {gatekeeperId: WorkpieceId, actionId}[]}` (arrays rather than one row per pair,
@@ -320,18 +341,21 @@ agent-facing `Worktree` binding API).
   which is what keeps the mistake-safeguard reliable:
   - `onRemote` — *proof* that the gatekeeper's remote possesses the object.
     Entered only by a hash-verified `put()` from that gatekeeper (during
-    `gitPull`, or opportunistically alongside an observation — a gatekeeper may
-    `put()` a commit's bytes when it stamps `gitCommits`, upgrading its
-    advertisement to proof) or by a successful push to it. This is what
+    `gitPull`, or opportunistically — a gatekeeper may `put()` a commit's
+    bytes in addition to advertising it, upgrading the advertisement to
+    proof) or by a successful push to it. This is what
     `get()` serves, what ancestry verification terminates on, and what the
     marking walk skips.
-  - `pullableFrom` — unproven *hints*: `ObservationDescription.gitCommits`
-    advertisements (written at `authorizeObservation`), plus the referent oids
+  - `pullableFrom` — unproven *hints*: `GitCache.advertiseCommit()`
+    advertisements, plus the referent oids
     recorded whenever a gatekeeper `put()`s a tree or commit (each entry / tree
     pointer / parent, type derived from the entry mode or header — this is what
     creates rows for objects never fetched, and the sketch's "referenced by
     another object populated by this gatekeeper" and "populated in the past,
-    since evicted" pull cases). Used for pull routing (which gatekeeper to try)
+    since evicted" pull cases). Every `pullableFrom` write thus flows through
+    the per-gatekeeper-minted cache stub (`advertiseCommit` or `put()`
+    referents), so attribution is inherent in the capability. Used for pull
+    routing (which gatekeeper to try)
     and for the marking walk's remote-known exclusion; grants no reads. A wrong
     or stale claim only misroutes a pull (which fails, and the next recorded
     source is tried) or under-fills the claimant's own packs (its own remote
@@ -634,8 +658,10 @@ agent-facing `Worktree` binding API).
 ### 3. GitHub gatekeeper: git operations (gatekeeper-github)
 
 - **Session API** — extend `GitHubRepo` (this is the `types.d.ts` TODO), all
-  observations, all stamping `gitCommits` with every commit id they return
-  (cursor-returning methods stamp per page — see below):
+  observations, every commit id they return advertised via
+  `GitCache.advertiseCommit()` (cursor-returning methods advertise per page —
+  see below; the session obtains its cache stub once, via
+  `ObservationAuthorizer.getGitCache()`):
   - `listBranches(filter?) → Cursor<{name, headCommit, ...}>`
   - `listTags(filter?) → Cursor<{name, commit, ...}>`
   - `getCommit(ref) → CommitDetails` — full/truncated SHA, branch, or tag; REST
@@ -644,25 +670,23 @@ agent-facing `Worktree` binding API).
   - `listCommits({branch?, path?, since?, ...}) → Cursor<CommitSummary>` — history
     enumeration.
   - `GitHubPullRequest.listCommits() → Cursor<CommitSummary>`.
-  - **Cursor methods stamp per page.** The existing cursor pattern authorizes
+  - **Cursor methods advertise per page.** The existing cursor pattern authorizes
     once up front and then fetches pages lazily (`github.ts`'s session methods
     authorize, then return a lazy `StreamingCursor`), so at method-call time no
-    commit ids exist to stamp. The up-front `authorizeObservation` still gates
-    the read exactly as today (and carries no `gitCommits`); the commit ids are
-    advertised by the *pages*: the session wraps the returned cursor in a
-    stamping cursor holding a `dup()` of the approval-queue stub, and each
-    `next()` whose page carries commit ids records a follow-up observation
-    through the same `authorizeObservation` chokepoint with that page's
-    `gitCommits` (titled as a continuation, e.g. "List commits — page 2"). A
-    page with no commit ids records nothing. This preserves the §1 invariant —
-    every advertised commit flows through the chokepoint that writes
-    `pullableFrom` — without making listings eager, at the cost of one
-    observation row per fetched page (bounded by how far the agent actually
-    iterates).
-  - Stamp `gitCommits` on existing SHA-bearing observations too (`readDiff`'s
-    base/head SHAs, `getDetails` branch refs). Stamps are pull-routing hints
-    only; a gatekeeper *may* also `put()` a commit's bytes alongside an
-    observation to upgrade the hint to `onRemote` proof (§1) — not needed for
+    commit ids exist to advertise. The up-front `authorizeObservation` still
+    gates the read exactly as today; the commit ids are
+    advertised by the *pages*: the session wraps the returned cursor in an
+    advertising cursor holding a `dup()` of the session's cache stub, and each
+    `next()` advertises that page's commit ids (parallel `advertiseCommit()`
+    calls; a page with no commit ids advertises nothing). An advertisement is
+    workspace-internal pull-routing metadata, not a read, so no observation
+    accompanies a page fetch and the audit log stays free of per-page noise —
+    listings stay lazy, and the cost is bounded by how far the agent actually
+    iterates.
+  - Advertise the SHAs existing observations already return, too (`readDiff`'s
+    base/head SHAs, `getDetails` branch refs). Advertisements are pull-routing
+    hints only; a gatekeeper *may* also `put()` a commit's bytes to upgrade the
+    hint to `onRemote` proof (§1) — not needed for
     the v1 flows, where worktree creation pulls the base.
   - Observer verification: unchanged — strategy B's repo ACL covers git data.
 - **`gitPull(oids, cache, hints)`** on the gatekeeper DO (`GitHubGatekeeperImpl`):
@@ -683,10 +707,11 @@ agent-facing `Worktree` binding API).
     no `have`s (the transport locked decision — a `have` from a filtered pull
     would exclude exactly the omitted objects a blob/tree fault wants);
     immediate `done`, single round.
-  - Parse the returned pack — reusing isomorphic-git's pack parsing / delta
-    resolution internals if reachable, else a small hand-rolled parser (wire packs
-    contain ofs/ref deltas; resolution is the only nontrivial part) — and `put`
-    every unpacked object into the `GitCache`. Nothing is retained locally.
+  - Strip the response's protocol framing (pkt-line, sideband demux) and stream
+    the raw pack body into `GitCache.consumePack()`, which unpacks and stores
+    every object overseer-side (delta resolution included — §1), then verify the
+    requested oids appear among the returned list. No pack parsing in the
+    gatekeeper; nothing is retained locally.
   - Blob faults: individual/batched blob `want`s over the same fetch command
     (partial-clone lazy fetch — this is exactly what git itself does against
     GitHub). Oversize protection per spike 1's outcome: either a
@@ -770,17 +795,23 @@ agent-facing `Worktree` binding API).
 
 - The `gatekeeper.ts` types from 34ebecd land essentially as sketched, with:
   - `GitCache` finalized as `get(oid, hints?)` / `has` / `stat` / `put` /
-    `buildPack()` (§1); the sketch's `pull()` TODO resolves by *deletion* —
-    gatekeepers never trigger pulls. Doc-comment the scoped view
+    `advertiseCommit()` / `buildPack()` / `consumePack()` (§1); the sketch's
+    `pull()` TODO resolves by
+    *deletion* — gatekeepers never trigger pulls. The interface extends
+    `RpcTarget`, and `gitPull`/`applyAction` receive it as `RpcStub<GitCache>`.
+    Doc-comment the scoped view
     (`onRemote ∪ pendingPush`, null otherwise, uniformly across
     `get`/`has`/`stat`), the simulation contract (a pending commit reads as
-    already pushed), `buildPack()`'s zero-argument, apply-time-only nature (the
-    action-scoped stub supplies the commit list and closure), and the
-    parallel-`put` note (no batch method; the stub is facet-to-parent, always
-    local).
+    already pushed), `advertiseCommit()`'s assertion-not-proof grade and
+    commits-only scope (trees/blobs are advertised implicitly as `put()`
+    referents), `buildPack()`'s zero-argument, apply-time-only nature (the
+    action-scoped stub supplies the commit list and closure),
+    `consumePack()`'s equivalence to a sequence of `put()`s, and the
+    parallel-`put` note (no batch method for loose objects — `consumePack` is
+    the bulk path for packs; the stub is facet-to-parent, always local).
   - `ActionDescription.pushedCommits?: GitOid[]` — the push declaration
     `submitAction` verifies and marks (§1). Doc-comment the symmetry:
-    observations *advertise* commits (`gitCommits` — unproven pull-routing
+    gatekeepers *advertise* commits (`advertiseCommit()` — unproven pull-routing
     hints), actions *declare* pushes (`pushedCommits` — ancestry-checked as a
     mistake-safeguard, and the source of the pending-push view that simulation
     reads).
@@ -872,7 +903,9 @@ agent-facing `Worktree` binding API).
    know which world it is in.
 2. **isomorphic-git pack parsing reusability**: can its pack/delta machinery be
    driven standalone (without its fs/gitdir assumptions), or do we write the
-   ~200-line parser ourselves?
+   ~200-line parser ourselves? This informs `GitCacheImpl.consumePack()` in
+   workshop-backend (the decoder lives overseer-side, not in gatekeepers), so
+   it lands before or with commit 2, not commit 6.
 
 ## Known edge cases / watch-fors
 
@@ -972,9 +1005,12 @@ agent-facing `Worktree` binding API).
   requesting a large fully-local tree is not a concern worth guarding, and the
   whole interface is expected to change in a near-term follow-up — so no
   hardening now.
-- **Pack parsing is hostile-input parsing**: the pack comes from GitHub over TLS,
-  but parse defensively anyway (bounded allocations, no trust in claimed sizes) —
-  and `GitCache.put()`'s hash verification is the backstop for object *content*.
+- **Pack parsing is hostile-input parsing**: `consumePack()` makes the pack
+  decoder a kernel-side component whose input stream comes from a gatekeeper
+  (for GitHub, bytes it relayed over TLS — but any gatekeeper can feed it
+  anything), so parse defensively (bounded allocations, no trust in claimed
+  sizes) — hash verification of each decoded object is the backstop for object
+  *content*, exactly as with `put()`.
 - **Rate/size limits**: one fetch per worktree creation and per batch fault keeps
   request counts trivial; the transfer-size limiter pattern from artifact-sync
   (64MB) should wrap the fetch body.
@@ -982,8 +1018,11 @@ agent-facing `Worktree` binding API).
 ## Commit sequence
 
 Ordered so kernel diffs are isolated and reviewable apart from the gatekeeper work
-(AGENTS.md kernel bar); each commit builds/tests green unless noted. PR boundaries
-to be decided later.
+(AGENTS.md kernel bar). Each commit keeps the packages it *modifies* building and
+testing green; packages that merely depend on a modified one are allowed — and
+expected — to be temporarily broken until the later commit that adapts them (e.g.
+workshop-backend does not compile between commits 1 and 2). No vacuous stubs just
+to keep dependents compiling. PR boundaries to be decided later.
 
 0. **Prerequisite: the step-transactionality refactor**
    (plans/step-transactionality.md) lands first, as its own PR — it fixes a live
@@ -992,23 +1031,32 @@ to be decided later.
    head advancements have no crash machinery of their own).
 1. **shared: git cache API** (workshop-shared) — finalize changes from 34ebecd:
    `gatekeeper.ts` additions (`GitCache` as scoped `get(oid, hints?)`/`has`/
-   `stat`/`put`/`buildPack` with the parallel-`put` doc note and the simulation
-   contract, `GitPullHints` with `commitHistory` required, `Gatekeeper.gitPull`,
-   the `GitCache` parameter on `Gatekeeper.applyAction`,
-   `ActionDescription.pushedCommits`, `ObservationAuthorizer.getGitCache`,
-   `ObservationDescription.gitCommits`), fully doc-commented. No implementation
-   yet; overseer gains a stub `getGitCache` so the tree compiles.
+   `stat`/`put`/`advertiseCommit`/`buildPack`/`consumePack` with the
+   parallel-`put` doc note and
+   the simulation contract, `GitPullHints` with `commitHistory` required,
+   `Gatekeeper.gitPull`, the `RpcStub<GitCache>` parameter on
+   `Gatekeeper.applyAction`, `ActionDescription.pushedCommits`,
+   `ObservationAuthorizer.getGitCache`),
+   fully doc-commented. No implementation yet: workshop-backend is left
+   uncompiling until commit 2 (per the per-package rule above). The one
+   downstream adaptation shipped here is gatekeeper-cloudflare's, whose
+   read-only `applyAction` aligns its signature with the interface so the
+   class-typed test facet can pass a stand-in cache.
 2. **backend: git cache + provenance + push authorization** — `GitCacheImpl`
    (per-gatekeeper stub minting; scoped `get`/`has`/`stat` incl. pending-push
    pull-through with hints; `put()` with proof-of-possession recording;
-   `buildPack` over a new undeltified pack writer), `gitObjectMetadata`
+   `buildPack` over a new undeltified pack writer; `consumePack` over a new
+   pack reader with ofs/ref delta resolution — spike 2 decides isomorphic-git
+   reuse vs. the hand-rolled parser), `gitObjectMetadata`
    (type/size/`onRemote`/`pullableFrom`/`pendingPush`) + the `pushMarks` action
-   index, metadata recording at `authorizeObservation` and `put()` (incl.
+   index, metadata recording at `advertiseCommit()` and `put()` (incl.
    tree/commit referent rows), `submitAction` ancestry verification + marking
    walk + lazy propagation + mark lifecycle (apply-converts / reject-cleans /
    revert-keeps), `ensureGitObjects` pull driver, the lazy walker
    (`ensureObject`, hand-rolled tree/commit parsers over the shared raw codec),
-   passing the cache to `applyAction`, git-store extensions (`readFileAtCommit`,
+   passing the cache to `applyAction` and implementing `getGitCache()` on
+   `ApprovalQueueImpl`/`SlashCommandAuthorizerImpl` (this commit returns
+   workshop-backend to green), git-store extensions (`readFileAtCommit`,
    `listTreeEntries`, `writeChangedFilesAsCommit` with separate
    treeBase/parents, raw object helpers). Workerd tests: cache round-trips vs
    known-good git hashes, poison rejection, metadata at every write point,
@@ -1017,8 +1065,8 @@ to be decided later.
    gitPull carve-out — surfaces the too-large error, records nothing, and
    retries on the next read),
    fault-pull-retry with a mock gatekeeper, ancestry verification (proven-base
-   pass; absent-ancestor error; root-commit rejection; advertisement alone
-   rejected while observation-time `put()` passes), marking-walk matrix
+   pass; absent-ancestor error; root-commit rejection; `advertiseCommit()`
+   alone rejected while `put()` passes), marking-walk matrix
    (remote-known skipped without descent, gitlinks skipped, absent objects
    marked + lazy propagation at `put()`), the `get()`/`has()`/`stat()` view
    matrix (onRemote / pendingPush / other × present / absent, pull-through
@@ -1027,6 +1075,9 @@ to be decided later.
    `buildPack` completing the closure (absent marked tree faulted → children
    marked and faulted in turn, batched per source; action-scoped stub required,
    session stub throws) with output verified by real `git index-pack` fixtures,
+   `consumePack` decoding packs produced by real `git pack-objects` (incl.
+   ofs/ref delta objects) with `put()`-equivalent verification and metadata
+   (and rejecting corrupt/oversized input defensively),
    walker output
    cross-verified against isomorphic-git over the same store, changed-files
    commits reusing subtree oids and preserving modes (edited `100755` file
@@ -1088,21 +1139,24 @@ to be decided later.
    executeCode calls per turn each advancing the head across separate barriers,
    multiple commits within one step (advancements ordered within the message).
 5. **github: session git reads** — `listBranches`/`listTags`/`getCommit`/
-   `listCommits`/PR `listCommits`, `gitCommits` stamping (new + existing SHA-bearing
-   observations; per-page follow-up observations from the stamping cursor
+   `listCommits`/PR `listCommits`, `advertiseCommit()` calls (on new + existing
+   SHA-bearing reads; per-page advertising via the cursor
    wrapper), types.d.ts docs. Pure REST; no protocol code yet. Tests extend
-   `github-api.test.ts` patterns; include per-page stamping (every commit id a
-   cursor returns appears in some recorded observation's `gitCommits`; pages
-   never fetched are never stamped; commit-free pages record nothing).
+   `github-api.test.ts` patterns; include per-page advertising (every commit id
+   a cursor returns is advertised; pages
+   never fetched are never advertised; commit-free pages advertise nothing).
 6. **github: fetch transport + gitPull** — pkt-line composer/parser, protocol-v2
    fetch client (wants/shallow/filter/done — no `have`s, per the transport
-   locked decision), pack unpacking into `GitCache`, transfer-size limiting,
-   oversized-blob handling per spike 1.
-   Tests: pkt-line round-trips, pack fixtures produced by real git (incl. delta
-   objects), hint mapping — including the hints-to-filter-spec matrix (blob
+   locked decision), sideband demux streaming the pack body into
+   `GitCache.consumePack()` (no pack parsing in the gatekeeper — §1),
+   transfer-size limiting, oversized-blob handling per spike 1.
+   Tests: pkt-line round-trips, framing demux feeding `consumePack` (against a
+   mock cache; real pack decoding is commit 2's test surface), hint mapping —
+   including the hints-to-filter-spec matrix (blob
    only, tree only, both → `combine:` or the tree-only fallback per spike 1's
    outcome; never two `filter` lines) — and that no fetch command ever emits a
-   `have` line. (Spikes 1–2 land before or with this commit.)
+   `have` line. (Spike 1 lands before or with this commit; spike 2 belongs to
+   commit 2.)
 7. **github: push + PR-from-commit** — `push` action (queue/simulate/apply/
    revert): `pushedCommits` declaration, simulation overlay reading pending
    commits via `get()`, apply = `buildPack` stream → send-pack framing +
