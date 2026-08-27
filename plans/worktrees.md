@@ -106,15 +106,22 @@ agent-facing `Worktree` binding API).
   commit (auto-commits become dangling objects; there is no GC, and dangling loose
   objects are cheap).
 - **Transport: custom smart-HTTP fetch client, not isomorphic-git's high-level fetch.**
-  Protocol v2, pkt-line composed by hand, `want`s by SHA, one-shot `have`s followed by
-  an immediate `done` (no multi-round negotiation — isomorphic-git does no better).
+  Protocol v2, pkt-line composed by hand, `want`s by SHA, **no `have`s ever** —
+  an empty have list and an immediate `done` on every fetch (no negotiation; the
+  same noop stance git itself takes for partial-clone lazy fetches).
   Reuse isomorphic-git's packfile parsing (delta resolution) where its internals allow.
   Packfiles are unpacked wholesale into the `GitCache` and never stored or indexed
-  long-term: eviction + re-fetch replaces pack-based history storage. The gatekeeper
-  remembers tips it has fetched before to build the `have` list, but correctness never
-  depends on `have`s — all our pulls are shallow, so an empty `have` list merely
-  over-fetches a little. Git sync is generally simplified by the assumption that
-  intermediate changes were not synced through some path the gatekeeper didn't see.
+  long-term: eviction + re-fetch replaces pack-based history storage. The
+  no-`have`s rule is correctness, not laziness: a `have` asserts full
+  reachability, but every pull here is filtered or tree-limited, so possessing a
+  commit never implies possessing its blobs and trees — advertising one as a
+  `have` would make upload-pack exclude exactly the omitted objects a later
+  exact-object fault explicitly `want`s. Since all pulls are shallow and
+  filtered, the cost is only a modest over-fetch (a repeat creation from the
+  same repo re-downloads its shallow filtered pack); completeness-graded
+  `have`s are listed future work. Git sync is generally simplified by the
+  assumption that intermediate changes were not synced through some path the
+  gatekeeper didn't see.
 - **Push is native send-pack, not REST git-data — required, not preferred.** REST
   git-data re-creates objects server-side from JSON; any serialization difference
   yields a different SHA than the commit id the agent holds, silently breaking the
@@ -673,14 +680,13 @@ agent-facing `Worktree` binding API).
     only, and the exact-object pull-through defaults are pure tree filters —
     `tree:0` with a commit want, and `tree:1` with a tree want already
     excludes the entries' blobs, so no blob filter is needed alongside it.
-    `have`s from remembered previously-fetched tips (stored in the DO;
-    best-effort only — shallow pulls make missing `have`s cheap); immediate
-    `done`, single round.
+    no `have`s (the transport locked decision — a `have` from a filtered pull
+    would exclude exactly the omitted objects a blob/tree fault wants);
+    immediate `done`, single round.
   - Parse the returned pack — reusing isomorphic-git's pack parsing / delta
     resolution internals if reachable, else a small hand-rolled parser (wire packs
     contain ofs/ref deltas; resolution is the only nontrivial part) — and `put`
-    every unpacked object into the `GitCache`. Nothing retained locally except the
-    fetched-tips memory.
+    every unpacked object into the `GitCache`. Nothing is retained locally.
   - Blob faults: individual/batched blob `want`s over the same fetch command
     (partial-clone lazy fetch — this is exactly what git itself does against
     GitHub). Oversize protection per spike 1's outcome: either a
@@ -958,16 +964,14 @@ agent-facing `Worktree` binding API).
   decision), and a bare id triggers nothing in the existing client — the test
   guards exactly the set of things that would make `otClient.ts` fetch content.
 - **`getCodeAtCommit` is client-callable with an arbitrary oid** and materializes
-  the full tree server-side; a client that learns a worktree commit id must not be
-  able to make the overseer materialize (or fault-pull) a repo-scale tree. Guard
-  (locked): it **never faults** — any missing object is an immediate error, which
-  pulled repos (filtered, shallow) hit almost immediately — **and** it enforces a
-  **hard materialization cap** (total bytes / file count at gadget scale, aligned
-  with the existing `MAX_FILE_TEXT_LENGTH`-era limits) for fully-local trees.
-  Chosen over restricting to "gadget-history commits" because that has no cheap
-  discriminator: a worktree's locally-written commits carry no provenance rows
-  either, so classification would need its own bookkeeping while the cap needs
-  none.
+  the full tree server-side. Deliberately left alone (decided): it keeps its
+  existing non-faulting read path — a missing object is an immediate error, which
+  a filtered/shallow-pulled repo hits almost immediately, and wiring it into the
+  lazy walker would be added code for nothing — and it gets **no materialization
+  cap**. The RPC layer already bounds a response at 32MB, a client deliberately
+  requesting a large fully-local tree is not a concern worth guarding, and the
+  whole interface is expected to change in a near-term follow-up — so no
+  hardening now.
 - **Pack parsing is hostile-input parsing**: the pack comes from GitHub over TLS,
   but parse defensively anyway (bounded allocations, no trust in claimed sizes) —
   and `GitCache.put()`'s hash verification is the backstop for object *content*.
@@ -1091,13 +1095,14 @@ to be decided later.
    cursor returns appears in some recorded observation's `gitCommits`; pages
    never fetched are never stamped; commit-free pages record nothing).
 6. **github: fetch transport + gitPull** — pkt-line composer/parser, protocol-v2
-   fetch client (wants/shallow/filter/haves/done), pack unpacking into `GitCache`,
-   fetched-tips memory, transfer-size limiting, oversized-blob handling per spike 1.
+   fetch client (wants/shallow/filter/done — no `have`s, per the transport
+   locked decision), pack unpacking into `GitCache`, transfer-size limiting,
+   oversized-blob handling per spike 1.
    Tests: pkt-line round-trips, pack fixtures produced by real git (incl. delta
    objects), hint mapping — including the hints-to-filter-spec matrix (blob
    only, tree only, both → `combine:` or the tree-only fallback per spike 1's
-   outcome; never two `filter` lines) — and tips-based have construction.
-   (Spikes 1–2 land before or with this commit.)
+   outcome; never two `filter` lines) — and that no fetch command ever emits a
+   `have` line. (Spikes 1–2 land before or with this commit.)
 7. **github: push + PR-from-commit** — `push` action (queue/simulate/apply/
    revert): `pushedCommits` declaration, simulation overlay reading pending
    commits via `get()`, apply = `buildPack` stream → send-pack framing +
@@ -1146,6 +1151,13 @@ to be decided later.
   usage ships shallow-only defaults) — also the missing piece for cross-remote
   pushes of *pre-existing* diverged branches (§1's ancestry-verification bound:
   the head-to-ancestor commit chain must be cached).
+- Fetch negotiation (`have`s): v1 sends none, because every pull is filtered or
+  tree-limited and a `have` asserts full reachability — no fetched object here is
+  provably complete, and a wrong `have` makes upload-pack withhold omitted
+  objects a fault explicitly wants. If repeat-creation bandwidth ever matters,
+  `have`s need a completeness grade: remember tips only from creation-style
+  pulls (depth-1 + `blob:limit` at the standard limit), advertise them only on
+  commit-want creation pulls, never on exact-object faults.
 - Other git hosts (the gatekeeper interface is host-neutral by construction).
 - Auditing existing gatekeepers' actions for `applyAction` idempotency (the
   contract §4 documents; a pre-existing crash-tolerance requirement, not one
