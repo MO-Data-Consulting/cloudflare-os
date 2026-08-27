@@ -6,10 +6,11 @@ import {
 import { type Harness, startHarness } from "../src/harness.js";
 import { mockChatCompletion } from "../src/mock-model.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
-import { connect, nextUsernames, signUp } from "../src/rpc-client.js";
+import { connect, logIn, nextUsernames, signUp } from "../src/rpc-client.js";
 
 let harness: Harness | undefined;
 const network = new NetworkInterceptor([mockChatCompletion("Test chat")]);
+const REVOCATION_RESTART_SETTLE_MS = 250;
 
 beforeAll(async () => {
   network.install();
@@ -54,6 +55,12 @@ async function activate(workspace: RpcStub<Overseer>): Promise<string> {
   return id;
 }
 
+// Revocation aborts the workspace DO after its RPC response. Close linked sessions first, then
+// reconnect after the scheduled restart instead of treating that expected disconnect as a failure.
+function waitForRevocationRestart(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, REVOCATION_RESTART_SETTLE_MS));
+}
+
 it.concurrent("grants and revokes a use-only collaborator", async () => {
   const [ownerName, collaboratorName, intruderName] = usernames(
       "owner", "collaborator", "intruder");
@@ -83,15 +90,23 @@ it.concurrent("grants and revokes a use-only collaborator", async () => {
     role: "use",
   });
   await expect(collaboratorWorkspace.setTitle("Forbidden rename")).rejects.toThrow();
-
   const affected = await workspace.removeCollaborator(added.profile.id, []);
+  collaboratorWorkspace[Symbol.dispose]();
+  workspace[Symbol.dispose]();
+  collaborator[Symbol.dispose]();
+  collaboratorPublic[Symbol.dispose]();
+  owner[Symbol.dispose]();
+  ownerPublic[Symbol.dispose]();
+
   expect(affected).toContainEqual(expect.objectContaining({
     profile: expect.objectContaining({ id: collaboratorName }),
     oldRole: "use",
     newRole: null,
   }));
-  await expectOpenDenied(collaborator, workspaceId);
-  await workspace.deleteSelf();
+  await waitForRevocationRestart();
+  using reconnectedPublic = connect(requireHarness().url);
+  using reconnected = await logIn(reconnectedPublic, collaboratorName);
+  await expectOpenDenied(reconnected, workspaceId);
 });
 
 it.concurrent("revokes every key and recipient of one share link", async () => {
@@ -119,14 +134,25 @@ it.concurrent("revokes every key and recipient of one share link", async () => {
   using secondWorkspace = await second.openGadget(workspaceId, copied.key);
   expect(await firstWorkspace.getMetadata()).toMatchObject({ role: "use" });
   expect(await secondWorkspace.getMetadata()).toMatchObject({ role: "use" });
-
   const preview = await workspace.previewRevokeShareLink(link.linkId);
   expect(preview.map(user => user.profile.id).toSorted()).toEqual([firstName, secondName].toSorted());
   const affected = await workspace.revokeShareLink(link.linkId, []);
-  expect(affected.map(user => user.profile.id).toSorted()).toEqual([firstName, secondName].toSorted());
-  expect(await workspace.listShareLinks()).toEqual([]);
+  firstWorkspace[Symbol.dispose]();
+  secondWorkspace[Symbol.dispose]();
+  workspace[Symbol.dispose]();
+  first[Symbol.dispose]();
+  firstPublic[Symbol.dispose]();
+  second[Symbol.dispose]();
+  secondPublic[Symbol.dispose]();
+  owner[Symbol.dispose]();
+  ownerPublic[Symbol.dispose]();
 
-  await expectOpenDenied(first, workspaceId, link.key);
-  await expectOpenDenied(second, workspaceId, copied.key);
-  await workspace.deleteSelf();
+  expect(affected.map(user => user.profile.id).toSorted()).toEqual([firstName, secondName].toSorted());
+  await waitForRevocationRestart();
+  using firstReconnectPublic = connect(requireHarness().url);
+  using secondReconnectPublic = connect(requireHarness().url);
+  using firstReconnect = await logIn(firstReconnectPublic, firstName);
+  using secondReconnect = await logIn(secondReconnectPublic, secondName);
+  await expectOpenDenied(firstReconnect, workspaceId, link.key);
+  await expectOpenDenied(secondReconnect, workspaceId, copied.key);
 });

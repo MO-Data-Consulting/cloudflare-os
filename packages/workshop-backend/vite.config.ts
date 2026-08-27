@@ -22,28 +22,27 @@ export default {
         command: 'node scripts/build-format-blueprints.mjs',
         cache: false,
       },
-      /**
-       * A task rather than a package.json script so it can depend on the codegen above; a script
-       * would run it in vp's clean environment. `cache: false` because `build-browser-runtime.mjs`
-       * writes into the same package tracking hashes as its input, which vp declines to cache.
-       */
-      build: {
-        command: ['node build-browser-runtime.mjs', 'tsc --project tsconfig.browser.json', 'tsc'],
-        dependsOn: ['build:format-blueprints'],
+      'build:browser-runtime': {
+        command: 'node ../../scripts/with-timeout.ts --idle 60 --max 600 -- node build-browser-runtime.mjs',
         cache: false,
       },
-      /**
-       * The browser-runtime codegen is repeated here rather than shared because tasks are
-       * independent -- `vp run test` never triggers `build` -- and `src/generated/` is gitignored but
-       * imported by `src/`. It caches, unlike the blueprint codegen, because it reads no environment.
-       */
+      /** Builds the validated entrypoint shared by integration-test file workers. */
+      'build:integration-worker': {
+        command: 'node ../../scripts/with-timeout.ts --idle 60 --max 600 -- pnpm exec capnweb-validate build --out .wrangler/validate',
+        dependsOn: ['build:format-blueprints', 'build:browser-runtime'],
+        cache: false,
+      },
+      build: {
+        command: ['tsc --project tsconfig.browser.json', 'tsc'],
+        dependsOn: ['build:format-blueprints', 'build:browser-runtime'],
+        cache: false,
+      },
       test: {
         ...vitestTask([
-          'node build-browser-runtime.mjs',
           'vitest run',
           'vitest run --config vitest.integration.config.ts',
         ]),
-        dependsOn: ['build:format-blueprints'],
+        dependsOn: ['build:format-blueprints', 'build:browser-runtime'],
       },
     },
   },
