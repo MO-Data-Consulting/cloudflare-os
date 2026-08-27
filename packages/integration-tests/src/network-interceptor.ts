@@ -22,13 +22,18 @@ export type Handler = (
   request: Request,
 ) => Response | null | Promise<Response | null>;
 
+/** Decides whether one non-loopback request may use the real network. */
+export type AllowRequest = (url: URL, method: string, headers: Headers) => boolean;
+
 export class NetworkInterceptor {
   readonly #handlers: readonly Handler[];
+  readonly #allow: AllowRequest | undefined;
   #realFetch: typeof globalThis.fetch | null = null;
   #unmockedCalls: string[] = [];
 
-  constructor(handlers: Handler[] = []) {
+  constructor(handlers: Handler[] = [], allow?: AllowRequest) {
     this.#handlers = [...handlers];
+    this.#allow = allow;
   }
 
   install(): void {
@@ -54,6 +59,8 @@ export class NetworkInterceptor {
       // this point `input` is never forwarded anywhere, so disturbing it costs nothing.
       const request = new Request(input, init);
       const method = request.method.toUpperCase();
+
+      if (this.#allow?.(url, method, request.headers)) return realFetch(request);
 
       for (const handler of this.#handlers) {
         const response = await handler(url, method, request.headers, request);

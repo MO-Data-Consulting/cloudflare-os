@@ -12,10 +12,10 @@ let fetchedByReal: string[];
 
 beforeEach(() => {
   fetchedByReal = [];
-  globalThis.fetch = (async (input: unknown) => {
-    fetchedByReal.push(String(input));
+  globalThis.fetch = async (input: Parameters<typeof fetch>[0]) => {
+    fetchedByReal.push(input instanceof Request ? input.url : String(input));
     return new Response("from the real fetch");
-  }) as typeof globalThis.fetch;
+  };
 });
 
 afterEach(() => {
@@ -46,6 +46,16 @@ it("asks handlers in order and takes the first non-null answer", async () => {
   expect(await res.text()).toBe("two");
   expect(asked).toEqual(["declines vendor.test", "answers vendor.test"]);
   expect(fetchedByReal).toEqual([]);
+});
+
+it("passes an explicitly allowed external request to the real fetch", async () => {
+  const interceptor = new NetworkInterceptor([], url => url.hostname === "model.test");
+  interceptor.install();
+
+  const response = await fetch("https://model.test/chat");
+  expect(await response.text()).toBe("from the real fetch");
+  expect(fetchedByReal).toEqual(["https://model.test/chat"]);
+  expect(interceptor.getUnmockedCalls()).toEqual([]);
 });
 
 it("supports a handler that parks until the test provides an answer", async () => {
