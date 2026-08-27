@@ -76,6 +76,48 @@ export function createWorkshopHarness(
             });
             throw error;
           }
+
+          if (result.outcome.status === "completed" && turn.verifyAfterAccept !== undefined) {
+            try {
+              await withTimeout(
+                  opened.session.acceptChanges(), verificationBudget,
+                  "Accepting verified agent changes exceeded its time budget");
+            } catch (error) {
+              checks.push({
+                id: "accept.failed",
+                pass: false,
+                evidence: error instanceof Error ? error.message : String(error),
+              });
+              turns.push({
+                outcome: result.outcome,
+                checks,
+                turnWallMs,
+                verificationWallMs: Date.now() - verificationStartedAt,
+              });
+              throw error;
+            }
+
+            const afterAccept = new EvalVerifier(opened.session, result.workpieces);
+            try {
+              checks.push(...await withTimeout(
+                  afterAccept.collect(turn.verifyAfterAccept), verificationBudget,
+                  "Post-accept verification exceeded its time budget"));
+            } catch (error) {
+              checks.push(...afterAccept.results(), {
+                id: "post-accept-verifier.timeout",
+                pass: false,
+                evidence: error instanceof Error ? error.message : String(error),
+              });
+              turns.push({
+                outcome: result.outcome,
+                checks,
+                turnWallMs,
+                verificationWallMs: Date.now() - verificationStartedAt,
+              });
+              throw error;
+            }
+          }
+
           turns.push({
             outcome: result.outcome,
             checks,
