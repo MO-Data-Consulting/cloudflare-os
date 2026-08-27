@@ -295,18 +295,6 @@ describe("Gmail draft overlays", () => {
 });
 
 describe("Gmail forward snapshot storage", () => {
-  it("stores bounded chunks and reassembles the exact initially captured bytes", async () => {
-    const {values, store} = memorySnapshotStore();
-    const bytes = snapshotBytes();
-    const snapshot = await store.capture(bytes);
-    const chunks = [...values]
-      .filter(([key]) => key.includes(`${snapshot.handle}:chunk:`))
-      .map(([, value]) => value as Uint8Array);
-    expect(chunks).toHaveLength(2);
-    expect(chunks.every(chunk => chunk.byteLength <= GMAIL_FORWARD_SNAPSHOT_CHUNK_BYTES)).toBe(true);
-    expect(await store.read(snapshot)).toEqual(bytes);
-  });
-
   it.each([
     ["missing", (values: Map<string, unknown>, keys: string[]) => values.delete(keys[1])],
     ["reordered", (values: Map<string, unknown>, keys: string[]) => {

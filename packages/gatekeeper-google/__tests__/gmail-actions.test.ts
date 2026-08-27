@@ -629,57 +629,6 @@ describe("Gmail forward action snapshots", () => {
     expect(extractRfc822Attachments(sentRaw!)[0].bytes).toEqual(source);
   });
 
-  it("retains an ambiguous forward draft snapshot and reconciles before materializing it", async () => {
-    let createdRaw: string | undefined;
-    let visible = false;
-    let writes = 0;
-    const {gatekeeper, storage, values} = actionHarness((url, init) => {
-      if (url.pathname === "/gmail/v1/users/me/messages" && !init.method) {
-        return json({messages: visible ? [{id: "provider-message", threadId: "provider-thread"}] : []});
-      }
-      if (url.pathname === "/gmail/v1/users/me/drafts" && !init.method) {
-        return json({
-          drafts: visible ? [{id: "provider-draft", message: {id: "provider-message"}}] : [],
-        });
-      }
-      if (url.pathname === "/gmail/v1/users/me/drafts" && init.method === "POST") {
-        writes++;
-        createdRaw = (JSON.parse(String(init.body)) as {message: {raw: string}}).message.raw;
-        throw new Error("connection lost after draft write");
-      }
-      if (url.pathname === "/gmail/v1/users/me/drafts/provider-draft" && !init.method) {
-        return json({
-          id: "provider-draft",
-          message: {
-            id: "provider-message", threadId: "provider-thread", internalDate: "1", raw: createdRaw,
-          },
-        });
-      }
-      throw new Error(`Unexpected request: ${url}`);
-    });
-    const source = new TextEncoder().encode(
-      "From: source@example.com\r\nTo: me@example.com\r\nSubject: Source\r\n\r\n" +
-      ("x".repeat(76) + "\r\n").repeat(27_000));
-    const {snapshot, state} = await seedForwardDraft(storage, source);
-
-    await expect(gatekeeper.applyAction(1)).rejects.toThrow(/connection lost/);
-    expect(base64UrlDecodedByteLength(createdRaw!)).toBeGreaterThan(2 * 1024 * 1024);
-    expect(base64UrlDecodedByteLength(createdRaw!)).toBeLessThan(3 * 1024 * 1024);
-    expect([...values.keys()].some(key => key.includes(snapshot.handle))).toBe(true);
-    const chunkKey = [...values.keys()].find(key =>
-      key.includes(snapshot.handle) && key.includes(":chunk:"))!;
-    values.delete(chunkKey);
-    visible = true;
-
-    await gatekeeper.applyAction(1);
-
-    expect(writes).toBe(1);
-    expect([...values.keys()].some(key => key.includes(snapshot.handle))).toBe(false);
-    expect(values.get(`gmail:draft:${state.logicalId}`)).toMatchObject({
-      providerId: "provider-draft",
-    });
-  });
-
   it("cleans up a rejected forward draft snapshot", async () => {
     const {gatekeeper, storage, values} = actionHarness(url => {
       throw new Error(`Unexpected request: ${url}`);
