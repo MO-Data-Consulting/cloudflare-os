@@ -1,23 +1,15 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { z } from "zod";
-import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
+import { openAgentSession, type WorkshopAgentSession } from "../src/agent-session.js";
 import {
   startTestGatekeeperHarness, TEST_GATEKEEPER_WORKER, TEST_VENDOR_ID, type Harness,
 } from "../src/harness.js";
-import { scriptedChatCompletions } from "../src/mock-model.js";
-import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
-  accountLabel, connect, listConnectedAccounts, nextUsernames, signUp, waitFor,
-} from "../src/rpc-client.js";
-
-const MODEL_ID = "@cf/zai-org/glm-5.2";
-const MODEL_PROFILE: AiChatAuthorInfo = { type: "agent", id: MODEL_ID, name: "Scripted model" };
-const MODEL_CONFIG: AiModelConfig = {
-  provider: "cloudflare",
-  model: MODEL_ID,
-  accountId: "test-account",
-  apiToken: "test-token",
-};
+  scriptedChatCompletions, SCRIPTED_MODEL_CONFIG, SCRIPTED_MODEL_ID,
+  SCRIPTED_MODEL_PROFILE,
+} from "../src/mock-model.js";
+import { NetworkInterceptor } from "../src/network-interceptor.js";
+import { accountLabel, waitFor } from "../src/rpc-client.js";
 
 let harness: Harness;
 const model = scriptedChatCompletions([
@@ -66,28 +58,17 @@ async function actionState(label: string): Promise<TestActionState> {
 }
 
 it("holds a scripted agent write until the user approves it", async () => {
-  using publicApi = connect(harness.url);
-  const [username] = nextUsernames("agentaction");
-  if (username === undefined) throw new Error("Failed to allocate an action-test username");
-  using authenticated = await signUp(publicApi, username);
-
-  await authenticated.addModel(MODEL_PROFILE, MODEL_CONFIG);
-  await authenticated.setQuickModel(null);
-  await authenticated.setPreferredModel(MODEL_ID);
-  await authenticated.completeOnboarding();
-  await authenticated.provisionAmbientAccount(TEST_VENDOR_ID);
-  const account = await waitFor("the ambient test account to be provisioned", async () =>
-    (await listConnectedAccounts(authenticated)).find(entry => entry.vendorId === TEST_VENDOR_ID)
-      ?? null);
-  const label = accountLabel(account);
-
-  using workspace = await authenticated.newGadget();
-  const chatId = await workspace.newChat("Set the test value to 7.", MODEL_ID);
-  const pending = await waitFor("the test action to enter the approval queue", async () => {
-    const entries = (await workspace.listActions({ filter: "pending" })).entries;
-    return entries.length === 1 ? entries[0] : null;
+  await using session = await openAgentSession(harness.url, {
+    modelId: SCRIPTED_MODEL_ID,
+    userModel: { profile: SCRIPTED_MODEL_PROFILE, config: SCRIPTED_MODEL_CONFIG },
+    ambientVendorIds: [TEST_VENDOR_ID],
+    usernamePrefix: "agentaction",
   });
+  const label = accountLabel(session.connectedAccount(TEST_VENDOR_ID));
 
+  const firstTurn = await session.runTurn("Set the test value to 7.");
+  const pending = await waitForPendingAction(session);
+  expect(firstTurn.outcome).toEqual({ status: "completed" });
   expect(pending).toMatchObject({
     type: "action",
     state: "pending",
@@ -103,35 +84,34 @@ it("holds a scripted agent write until the user approves it", async () => {
   });
   expect(model.requests).toHaveLength(1);
 
-  await workspace.approveAction(pending.id);
-  const history = await waitFor("the scripted agent to continue after approval", async () => {
-    const current = await workspace.getChatHistory(chatId);
-    const error = current.messages.find(message => message.type === "error");
-    if (error !== undefined) throw new Error(`The scripted agent failed: ${error.message}`);
-    return current.messages.some(message =>
-      message.type === "message" && message.author.type === "agent" &&
-      message.message === "The test value was updated.") ? current : null;
-  });
-
+  const resumed = await session.approveActionAndWait(pending.id);
+  expect(resumed.outcome).toEqual({ status: "completed" });
   expect(await actionState(label)).toEqual({ pending: [], value: 7, applyCount: 1 });
-  const [approved] = (await workspace.listActions({ filter: "action" })).entries;
+  const [approved] = (await session.listActions({ filter: "action" })).entries;
   expect(approved).toMatchObject({ id: pending.id, state: "approved", type: "action" });
   if (approved?.type !== "action") throw new Error("Approved test action was not an action record");
-  expect(approved.resolvedBy).toMatchObject({ type: "user", id: username });
+  expect(approved.resolvedBy).toMatchObject({ type: "user", id: session.username });
   expect(model.requests).toHaveLength(2);
   expect(model.requests[1]).toMatchObject({
     messages: expect.arrayContaining([
       expect.objectContaining({ role: "tool", content: expect.stringContaining("1") }),
     ]),
   });
-  expect(history.messages).toEqual(expect.arrayContaining([
+  expect(resumed.history).toEqual(expect.arrayContaining([
     expect.objectContaining({
       type: "message",
       author: expect.objectContaining({ type: "agent" }),
       message: "The test value was updated.",
     }),
   ]));
-  await expect(workspace.approveAction(pending.id)).rejects.toThrow();
+  await expect(session.approveActionAndWait(pending.id)).rejects.toThrow();
   expect((await actionState(label)).applyCount).toBe(1);
   expect(model.remainingSteps()).toBe(0);
 });
+
+async function waitForPendingAction(session: WorkshopAgentSession) {
+  return waitFor("the test action to enter the approval queue", async () => {
+    const entries = (await session.listActions({ filter: "pending" })).entries;
+    return entries.length === 1 ? entries[0] : null;
+  });
+}
