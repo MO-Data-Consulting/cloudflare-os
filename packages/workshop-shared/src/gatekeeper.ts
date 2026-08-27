@@ -1290,10 +1290,7 @@ export interface HookController<Hook extends RpcTarget> extends WorkerEntrypoint
    *
    * If the hook was already enabled, the previously-registered `initiator` should be replaced.
    *
-   * `target` identifies where the hook delivers, for gatekeepers that display or link to it. A
-   * gatekeeper that doesn't need it may ignore the value, but must still *declare* the parameter:
-   * RPC argument validation is generated from the declared signature, and a call carrying an
-   * argument the receiver does not declare is rejected.
+   * `target` identifies where the hook delivers, for gatekeepers that display or link to it.
    */
   enable(initiator: Fetcher<HookInitiator<Hook>>, target: HookTargetMetadata): Promise<void>;
 

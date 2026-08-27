@@ -294,8 +294,21 @@ agent-facing `Worktree` binding API).
   `gitObjects` for two reasons: reading a `gitObjects` row means reading the
   whole object content, which is wasteful when only metadata is wanted; and
   metadata routinely exists for objects we *don't* hold — advertised commits,
-  filtered-out tree entries, and oversized blobs we declined to store (recording
-  their size lets a later `stat()`/read fail fast instead of refetching). The two
+  filtered-out tree entries, and oversized blobs we declined to store.
+  `size` is recorded **only from bytes we actually measured**: a normal
+  `put()`, or a `put()` rejected for exceeding the size cap (we had the
+  content in hand; the measurement is proof-grade, and it lets later
+  reads/greps of that blob fail fast instead of re-downloading it). Nothing
+  is ever inferred from a blob's *absence* — an omitted blob's size is
+  unknowable (tree entries carry no sizes, upload-pack reports nothing about
+  what a filter suppressed), and any absence-based record would durably
+  trust a gatekeeper's behavior as if it were a measurement: a buggy
+  omission must produce a retryable error, never a permanently wrong
+  fail-fast row. This costs nothing, because a fetch whose filter suppressed
+  a blob is inherently cheap to repeat — the expensive bytes were never
+  sent. Blobs too large for the transfer limiter itself never complete a
+  `put()`, so they also record nothing and error (agent-visibly) on each
+  attempt — accepted for such an extreme case. The two
   gatekeeper sets differ in **evidentiary grade** — proof versus assertion —
   which is what keeps the mistake-safeguard reliable:
   - `onRemote` — *proof* that the gatekeeper's remote possesses the object.
@@ -323,7 +336,13 @@ agent-facing `Worktree` binding API).
   gatekeeper on failure), reach the gatekeeper through `getGatekeeperFacet(id)` —
   the same instantiated-facet path every other invocation of an existing
   gatekeeper uses (observations, actions, hooks; overseer.ts:4261) — call
-  `gitPull(oids, cache, hints)`, verify the requested oids are now present.
+  `gitPull(oids, cache, hints)`, verify the requested oids are now present —
+  where "present" admits one deliberate exception: a requested *blob* still
+  absent after a success return, when the hints carried a blob filter, is
+  read as "unavailable at the supported size" and surfaces the ordinary
+  too-large read error rather than "pull failed". Nothing is recorded for it
+  (see the metadata bullet), so a next read simply retries — a gatekeeper
+  bug that wrongly omits a blob self-heals instead of wedging the file.
   A deleted gatekeeper record → clear error to the agent ("reconnect X to pull
   this commit"). Reachable only from overseer-initiated paths — agent-side
   faults (worktree creation and lazy reads) and the `get()`/`buildPack()`
@@ -458,14 +477,34 @@ agent-facing `Worktree` binding API).
     `defaultBindingList` (worktrees never seed chats), promotion/reconciliation
     sweeps (no head-commit work), blueprint enumeration/creation, ambient
     reconciliation, and the loader paths.
+  - **Storage migration — version 3 → 4, stamping existing rows.** `type` is a
+    *required* field on the unified record (an optional absent-means-gadget
+    default was rejected: it would push `undefined`-handling into every consumer
+    the audit touches, forever, to save a one-time rewrite of a small registry),
+    so gadget rows written before this change must be stamped `type: "gadget"`.
+    Follow the version-3 pattern (`#migrateToActionIndexes` in overseer.ts): a
+    synchronous constructor migration gated on `version.get() !== 3`, chained
+    after `#migrateToActionIndexes` in both constructor branches (so a v1
+    workspace runs 1→2, 2→3, 3→4 in one wake), one `transactionSync` re-putting
+    every `gadgets` row with `type: "gadget"` and writing `version.put(4)` last
+    inside it — atomic, so a crash mid-rewrite retries whole — and the guard
+    keeps never-initialized DOs write-free. `#initializeNewWorkspace` stamps 4,
+    and the `version` singleton's doc comment gains the `4 = ...` line. No
+    `byBindingName` rebuild is needed: every pre-existing row carries a
+    `bindingName`, so the keys the index already holds are exactly what the
+    `?? null` function computes for them — only new worktree rows hit the null
+    branch. Nothing else in this plan needs migration: `gitObjectMetadata` and
+    the `pushMarks` index are new (born empty), worktree rows are new, and the
+    new message fields (`createdWorktrees`, `worktreeCommits`, `worktreePins`)
+    and the `createWorktree` tool-call variant are optional additions that old
+    chat logs simply lack.
 - **`createWorktree` agent tool**, mirroring `createGadget`'s shape: validate the
   binding name against the chat's own binding map (the only namespace it occupies);
   resolve the commit id — full oid or unambiguous prefix — against the **local store
   and known metadata** (`gitObjects` ∪ `gitObjectMetadata`; ambiguous → error
   listing candidates; unknown → "look it up via the gatekeeper first"). There is no
   requirement that the commit came from a gatekeeper: any locally-present commit
-  works (a gadget's history, another worktree's commit) and needs no provenance,
-  since local-origin objects never fault. Then: create the record (pending, like
+  works (a gadget's history, another worktree's commit). Then: create the record (pending, like
   `createGadget` — stamped at the step barrier); add the chat binding; record
   `{worktreeId, changeId}` as the tool output so replay never re-creates. For gatekeeper-known commits, creation performs the **initial
   pull**: `gitPull([commit], cache, {type: "commit", commitHistory: {kind: "depth",
@@ -644,7 +683,13 @@ agent-facing `Worktree` binding API).
     fetched-tips memory.
   - Blob faults: individual/batched blob `want`s over the same fetch command
     (partial-clone lazy fetch — this is exactly what git itself does against
-    GitHub).
+    GitHub). Oversize protection per spike 1's outcome: either a
+    `blob:limit=MAX_WORKTREE_FILE_SIZE` guard filter (an oversized blob then
+    never downloads — the read errors, cheaply, on each attempt) or, if
+    explicit wants override filters, no filter plus the transfer limiter and
+    `put()`'s size rejection, whose measured size is the one thing metadata
+    records (§1: sizes from measured bytes only; omissions and limiter
+    aborts record nothing).
 - **Push** — queued action `push(branch, commitId, {force?})`:
   - Queue: the `ActionDescription` declares `pushedCommits: [commitId]`, and the
     overseer's `submitAction` verification + marking (§1) *is* the validation —
@@ -752,6 +797,12 @@ agent-facing `Worktree` binding API).
     transport can't combine them (upload-pack takes one filter-spec; combining
     needs the `combine:` grammar, §3) may honor only the tree filter — sound
     because hints are advisory by contract.
+  - `Gatekeeper.gitPull`'s "put each requested object or throw" contract gains
+    the filtered-omission carve-out (§1): a requested blob the hints' own
+    `filterBlobSize` suppressed is reported by returning successfully without
+    it, rather than by throwing — the overseer surfaces that absence as the
+    too-large read error (and deliberately records nothing from it; absence
+    is a gatekeeper behavior, not a measurement).
   - Doc comments to the kernel review bar on every export; `@validateRpc()` on the
     implementations (per repo convention — it goes on implementations, not
     interfaces).
@@ -802,11 +853,17 @@ agent-facing `Worktree` binding API).
    GitHub rejects it. (Partial-clone lazy fetch implies blob
    wants work; verify rather than assume — the repo's own AGENTS.md pattern.)
    Include: does `filter blob:limit` suppress **explicitly wanted** blobs? This
-   decides the oversized-blob fault path — either the wanted blob never arrives
-   (→ `gitObjectMetadata` marks it oversized so we don't refetch) or it arrives
-   huge (→ the transfer limiter and `put()`'s size rejection handle it, then
-   metadata records the size). Both are handled; the fetch client needs to know
-   which happens.
+   decides the oversized-blob fault path — either the wanted blob never
+   arrives (→ blob-fault fetches guard with
+   `blob:limit=MAX_WORKTREE_FILE_SIZE`; an oversized blob is never
+   downloaded, each read of it errors cheaply, and nothing is recorded —
+   §1's rule that absence proves nothing) or it
+   arrives huge (→ blob-fault fetches send no filter, since one wouldn't be
+   honored; the transfer limiter bounds the download, and `put()`'s size
+   rejection measures the exact size, which metadata records and later reads
+   fail fast on). Both are
+   handled with no absence-based bookkeeping; the fetch client just needs to
+   know which world it is in.
 2. **isomorphic-git pack parsing reusability**: can its pack/delta machinery be
    driven standalone (without its fs/gitdir assumptions), or do we write the
    ~200-line parser ourselves?
@@ -951,6 +1008,10 @@ to be decided later.
    `listTreeEntries`, `writeChangedFilesAsCommit` with separate
    treeBase/parents, raw object helpers). Workerd tests: cache round-trips vs
    known-good git hashes, poison rejection, metadata at every write point,
+   size recording from measured bytes only (exact `size` from a `put()` incl.
+   cap rejection, then fail-fast on later reads; a filtered omission — the
+   gitPull carve-out — surfaces the too-large error, records nothing, and
+   retries on the next read),
    fault-pull-retry with a mock gatekeeper, ancestry verification (proven-base
    pass; absent-ancestor error; root-commit rejection; advertisement alone
    rejected while observation-time `put()` passes), marking-walk matrix
@@ -975,7 +1036,10 @@ to be decided later.
    `WorkpieceRecord` (`type` discriminator, optional `bindingName`, null-index
    opt-out) with the full consumer audit (`subscribeToWorkpieces`,
    `defaultBindingList`, promotion/reconciliation, blueprint enumeration, loader
-   paths), api.ts additions (`createWorktree` tool-call variant,
+   paths), the version 3→4 storage migration stamping existing rows
+   `type: "gadget"` (chained after `#migrateToActionIndexes`;
+   `#initializeNewWorkspace` and the `version` singleton doc comment move to 4;
+   see §2), api.ts additions (`createWorktree` tool-call variant,
    `createdWorktrees` on changes messages) with the frontend's tool-call
    rendering cases (the exhaustive `AiToolCall` switches in `ChatInterface.tsx`),
    `createWorktree` tool (local + metadata prefix resolution, gatekeeper-free
@@ -984,7 +1048,10 @@ to be decided later.
    content for worktree roots in `buildChatContent`/session content (no
    system-prompt changes — worktrees are announced by their own tool results),
    **client delivery filtering** (rows, replay, messages, metadata;
-   revision-preserving). Tests: create/replay determinism,
+   revision-preserving). Tests: the 3→4 migration (pre-existing rows gain
+   `type: "gadget"` with their `byBindingName` entries intact; crash before the
+   stamp retries whole; never-initialized DOs stay write-free; chained run from
+   an older version), create/replay determinism,
    create-from-local-commit (no gatekeeper), edit-through-OT on a worktree, lazy
    blob fault, oversize/binary read errors, symlink/gitlink touch errors
    (message names the link target / submodule commit; writes rejected too),
