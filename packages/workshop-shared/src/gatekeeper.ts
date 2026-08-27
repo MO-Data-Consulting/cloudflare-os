@@ -803,23 +803,26 @@ export interface Gatekeeper<Session> extends DurableObject {
    *
    * The overseer will only ever pull objects that it knows the gatekeeper has, for one of the
    * following reasons:
-   * * The object was referenced by `ObservationDescription.gitCommits` for an observation made
-   *   through this gatekeeper.
+   * * The object is a commit this gatekeeper advertised via `GitCache.advertiseCommit()`.
    * * The object was referenced by another object populated by this gatekeeper (e.g. it is the
    *   parent of another commit from this gatekeeper).
    * * The object had been populated by this gatekeeper in the past, but was subsequently evicted
    *   from the cache.
    *
-   * The Gatekeeper must put() each of the given objects into the cache (or throw an exception). It
-   * MAY also put other related objects into the cache. `hints` provides hints about what objects
-   * the caller would like to have prefetched into the cache, but the gatekeeper is not technically
-   * required to honor these hints. (Failing to prefetch related objects may lead to performance
-   * problems, however.)
+   * The Gatekeeper must put() each of the given objects into the cache (or throw an exception),
+   * with one carve-out: a requested *blob* that the hints' own `filterBlobSize` suppressed is
+   * reported by returning successfully without it, not by throwing. The overseer surfaces that
+   * absence to the agent as an oversized-file read error.
    *
-   * If the gatekeeper ever populates `ObservationDescription.gitCommits`, it MUST implement
-   * `gitPull()`. Otherwise, it can leave the method unimplemented.
+   * The Gatekeeper MAY also put other related objects into the cache. `hints` provides hints
+   * about what objects the caller would like to have prefetched into the cache, but the
+   * gatekeeper is not technically required to honor these hints. (Failing to prefetch related
+   * objects may lead to performance problems, however.)
+   *
+   * If the gatekeeper ever uses `GitCache`, it MUST implement `gitPull()`. Otherwise, it can leave
+   * the method unimplemented.
    */
-  gitPull?(oids: GitOid[], cache: GitCache, hints: GitPullHints): Promise<void>;
+  gitPull?(oids: GitOid[], cache: RpcStub<GitCache>, hints: GitPullHints): Promise<void>;
 
   // ---------------------------------------------------------------------------
   // Callbacks invoked by the overseer to apply (or reject) actions that were previously queued
@@ -838,8 +841,20 @@ export interface Gatekeeper<Session> extends DurableObject {
    * Depending on policy conditions, an action may be approved and applied automatically. However,
    * the gatekeeper is nevertheless expected to submit all actions for approval; there is no mode
    * in which it's OK to skip the check.
+   *
+   * To the maximum extent possible, implementations of `applyAction()` should be idempotent, as
+   * a poorly-timed crash may cause the overseer to fail to record that an `applyAction()`
+   * completed, and the user will likely then try to apply the action again in the future.
+   *
+   * `cache` provides access to the workspace's git cache, which is often needed at apply time
+   * (when no `ObservationAuthorizer` is available). In fact, this stub points to a wrapper around
+   * `GitCache` that is scoped specifically for this action, which enables the `buildPack()` method
+   * to function -- it will build a pack specifically for the set of commits that had been listed
+   * in the action's `ActionDescription.pushedCommits`. Actions that don't interact with git can
+   * ignore this parameter (and can even omit the parameter from their `applyAction()`
+   * declaration).
    */
-  applyAction(action: number): Promise<void>;
+  applyAction(action: number, cache: RpcStub<GitCache>): Promise<void>;
 
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any
@@ -892,9 +907,13 @@ export interface ObservationAuthorizer extends RpcTarget {
   authorizeObservation(description: ObservationDescription): Promise<void>;
 
   /**
-   * Get the workspace's git cache. The gatekeeper may optionally use this to pre-populate the
-   * cache with observed commits. If it does not do so, then the commits will be pulled when
-   * first needed (see `Gatekeeper.gitPull()`).
+   * Get the workspace's git cache, scoped to this gatekeeper (see `GitCache` for the view rules).
+   *
+   * A gatekeeper whose API returns git commit IDs should advertise them through this cache
+   * (`GitCache.advertiseCommit()`) so that the overseer knows where to pull them from when they
+   * are needed (see `Gatekeeper.gitPull()`). It may also pre-populate the cache with the commits'
+   * actual content (`GitCache.put()`); a hash-verified `put()` upgrades an advertisement to proof
+   * of possession.
    */
   getGitCache(): Promise<GitCache>;
 }
@@ -1088,17 +1107,6 @@ export type ObservationDescription = {
    */
   description: string;
 
-  /**
-   * If present, the observation references one or more git commits which may be pulled from this
-   * gatekeeper.
-   *
-   * Each string in the list is a git commit ID. The overseer will record that these commits may
-   * be pulled from this provider, if needed. If the commit is found to be needed in the future
-   * (e.g. because the agent requests to mount it as a workpiece), the overseer will pull the
-   * commit (and possibly parents) from this gatekeeper, into the workspace's local git repo.
-   */
-  gitCommits?: string[];
-
   // ----------------------------------------------------------------------------
   // Policy hints
   //
@@ -1178,6 +1186,32 @@ export type ActionDescription = {
    * consider before approving.
    */
   description: string;
+
+  /**
+   * If present, applying this action will push the named commits to the remote resource this
+   * gatekeeper fronts.
+   *
+   * At the time the action is submitted, the overseer may validate whether it makes sense to push
+   * this commit (and the transitive closure of objects that come with it) to this gatekeeper, and
+   * whether the gatekeeper is allowed to receive these commits. A variety of security policies,
+   * possibly configured by the user or site administrator, may affect this decision. One common
+   * policy is that a commit should not be pushed to a remote if its ancestors did not come from
+   * that remote -- a policy which prevents accidentally pushing commits to the wrong repository,
+   * possibly exposing confidential data. In any case, the Overseer typically applies such policies
+   * at submit time (rather than apply time) and, if they indicate the action should not proceed,
+   * will cause `submitAction()` to throw an exception.
+   *
+   * Even when the action is successfully submitted, the Gatekeeper is obliged -- as always -- not
+   * to actually transmit any data until the action is approved and applied with `applyAction()`.
+   * As always, though, the Gatekeeper is expected to simulate the effects of the action
+   * immediately. E.g. if the agent queries the state of the remote repo, the Gatekeeper should
+   * indicate that the push has completed.
+   *
+   * In order to assist in simulation, the `GitCache` passed to the Gatekeeper will always provide
+   * access to all objects which are pending a push (part of a submitted but not-yet-applied
+   * action). See `GitCache` for more info.
+   */
+  pushedCommits?: GitOid[];
 
   /**
    * Does the Gatekeeper implement `revertAction()` for this action?
@@ -1336,7 +1370,7 @@ export type GitOid = string;
 export type GitObjectType = "commit" | "tree" | "blob" | "tag";
 
 /**
- * Interface to the workspace's git object cache.
+ * Interface to the workspace's git object cache, as exposed to one gatekeeper.
  *
  * Each workspace maintains a cache of git objects, i.e. commits and their file trees. This cache
  * is used to store code backing gadgets as well as local checkouts of git repositories that the
@@ -1356,20 +1390,49 @@ export type GitObjectType = "commit" | "tree" | "blob" | "tag";
  * Workspace also expects that if it received a particular object from a particular Gatekeeper, it
  * can also pull all the objects referenced by that object (e.g. a commit's parent, or its file
  * tree) from the same gatekeeper. Thus, the workspace can lazily populate the stuff that it needs.
+ *
+ * Every `GitCache` stub is scoped to the gatekeeper it was handed to. Reads (`get()`, `has()`,
+ * `stat()`) answer for exactly two sets of objects, and return null/false for everything else:
+ *
+ * 1. Objects which the Gatekeeper itself has previously written to cache using `put()`, or which
+ *    were successfully pushed to this gatekeeper by an applied action -- so long as said objects
+ *    haven't been evicted in the meantime. In other words, these ane objects that are known to
+ *    be on the remote already, and also happen to be available in local cache.
+ * 2. Objects queued for push to this gatekeeper by a submitted, not-yet-applied action (see
+ *    `ActionDescription.pushedCommits`). These objects are NOT believed to be on the remote
+ *    already, but are planned to pushed to it assuming the submitted action is later approved.
+ *
+ * This is intended to assist the Gatekeeper in simulation: If the Gatekeeper provides an API to
+ * the agent/Gadget by which the caller can read back a specific commit, the Gatekeeper should
+ * first try to read that commit from cache, and fall back to reading it from the remote. This
+ * strategy correctly produces the commit if and only if the Gatekeeper is "supposed to" have it,
+ * for simulation purposes.
  */
-export interface GitCache {
+export interface GitCache extends RpcTarget {
   /**
-   * Read the given git object from the cache. Returns null if not present.
+   * Read the given git object from the cache. Returns null if the object is not in this
+   * gatekeeper's view (see the interface doc for the view rules).
    *
    * `content` is strictly the object payload. It does NOT include the `<type> <size>\0` header,
    * even though that header is included in the hash.
+   *
+   * An object that is pending push to this gatekeeper but not locally cached is pulled through
+   * from its recorded source on demand, so a queued cross-remote push can be simulated as if it
+   * had already landed. Simulation contract: a commit that reads back while pending push should
+   * be treated, for simulation purposes, as already pushed. The optional `hints` are advisory
+   * prefetch guidance for that pull-through -- a gatekeeper walking objects by hand can request
+   * related objects up front rather than faulting once per `get()`. When omitted, the pull
+   * requests exactly this object, with its type taken from recorded metadata.
    */
-  get(id: GitOid): Promise<{type: GitObjectType, content: Uint8Array} | null>;
+  get(id: GitOid, hints?: GitPullHints): Promise<{type: GitObjectType, content: Uint8Array} | null>;
 
-  /** Return whether the given object exists in cache. */
+  /** Return whether the given object exists, under the same scoped view as `get()`. */
   has(id: GitOid): Promise<boolean>;
 
-  /** Return the type and byte size of the given object, if it is in cache. */
+  /**
+   * Return the type and byte size of the given object, or null, under the same scoped view as
+   * `get()`.
+   */
   stat(id: GitOid): Promise<{type: GitObjectType, size: number} | null>;
 
   /**
@@ -1377,20 +1440,56 @@ export interface GitCache {
    *
    * As with `get()`, the `content` must NOT include the `<type> <size>\0` header.
    *
-   * This interface is intentionally designed to make it impossible to poison the cache. If the
-   * returned oid doesn't match what the gatekeeper expected, it should probably throw an
-   * exception.
+   * This interface is intentionally designed to make it impossible to poison the cache: the oid
+   * is computed from the bytes themselves. If the returned oid doesn't match what the gatekeeper
+   * expected, it should probably throw an exception.
+   *
+   * A `put()` is also the system's proof of possession: it is what records that this gatekeeper's
+   * remote holds the object, making it readable through this stub and usable as a push-ancestry
+   * anchor (see `ActionDescription.pushedCommits`).
    */
   put(type: GitObjectType, content: Uint8Array): Promise<GitOid>;
 
-  // TODO: putStream() method for large blobs?
-  // TODO: pull() method which populates missing cache entries by pulling them immediately from
-  //   the appropriate gatekeeper? May not be useful since a gatekeeper probably shouldn't be
-  //   requesting oids that originated from other gatekeepers?
+  /**
+   * Declare that this gatekeeper's remote possesses the given commit and can provide it (and the
+   * objects it references) on demand via `Gatekeeper.gitPull()`. A gatekeeper whose API returns
+   * commit IDs to the agent/Gadget should advertise each one, so that if the agent later mounts
+   * a commit as a worktree, the overseer knows to pull it from this gatekeeper.
+   */
+  advertiseCommit(commitId: GitOid): Promise<void>;
+
+  /**
+   * Build a packfile carrying the applying action's full pending-push closure.
+   *
+   * Only the action-scoped stub passed to `Gatekeeper.applyAction()` supports this; calling it on
+   * any other stub (e.g. one obtained via `ObservationAuthorizer.getGitCache()` during a session)
+   * throws. It takes no arguments: the commit list is the applying action's own
+   * `ActionDescription.pushedCommits`, combined with the closure of objects that the overseer
+   * believes the remote may not already have.
+   *
+   * The stream contains a packfile with the standard SHA-1 trailer, suitable for feeding directly
+   * into a send-pack request. The overseer completes the closure itself, pulling any
+   * locally-absent objects from their recorded sources before they are streamed; if a source
+   * is no longer available (e.g. its gatekeeper was disconnected), the call fails with an error
+   * naming the gatekeeper to reconnect.
+   */
+  buildPack(): Promise<ReadableStream<Uint8Array>>;
+
+  /**
+   * Consumes a standard git packfile and inserts all the objects within into the git cache. This
+   * is exactly equivalent to if the Gatekeeper decoded the packfile itself and `put()` each object
+   * into the cache.
+   */
+  consumePack(pack: ReadableStream<Uint8Array>): Promise<GitOid[]>;
+
+  // TODO(someday): putStream() method for large blobs?
 }
 
 /**
- * Hints provided to Gatekeeper.pull() which may help the gatekeeper decide how much to pull.
+ * Hints provided to `Gatekeeper.gitPull()` which may help the gatekeeper decide how much to pull.
+ *
+ * Hints are advisory: honoring them well affects performance, not correctness (with one
+ * exception -- see `Gatekeeper.gitPull()`'s carve-out for blobs suppressed by `filterBlobSize`).
  *
  * The options are designed with the details of the standard git protocol in mind.
  */
@@ -1405,13 +1504,26 @@ export type GitPullHints = {
    */
   referencedBy?: GitOid;
 
-  /** How far back in the commit history to go. */
+  /**
+   * How far back in the commit history to go.
+   *
+   * The overseer uses this to request shallow clones. In fact, the overseer typically always
+   * requests only shallow clones, which is why this property is required: the intuitive default
+   * would be to request a full clone, but that is almost never what we want in Cloudflare OS.
+   */
   commitHistory:
     | { kind: "full" }
     | { kind: "depth", depth: number }
     | { kind: "since", since: Date };
 
-  /** Omit blobs of at least this size. 0 = do not fetch blobs at all. */
+  /**
+   * Omit blobs of at least this size. 0 = do not fetch blobs at all.
+   *
+   * May be set together with `filterTreeDepth`. A gatekeeper whose transport cannot combine the
+   * two (git's upload-pack accepts a single filter-spec per fetch; combining requires the
+   * `combine:` filter grammar) may honor only the tree filter -- sound because hints are
+   * advisory, at the cost of over-fetching some blobs.
+   */
   filterBlobSize?: number;
 
   /**
@@ -1421,6 +1533,8 @@ export type GitPullHints = {
    * 1 = Only fetch the root at each commit.
    * 2 = Only fetch the root and first-level subdirectories.
    * n = ...
+   *
+   * See `filterBlobSize` for combining the two filters.
    */
   filterTreeDepth?: number;
 }
