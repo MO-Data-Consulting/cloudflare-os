@@ -34,7 +34,7 @@ import { AccountChooser, AccountOption } from './gatekeeper-modal/AccountChooser
 import { matchesResourceUrl } from './resourceMatching'
 import { reportIssue } from './errorReporting'
 import { useSiteName } from './ServerConfigContext'
-import { AccountsSubscriberAdapter } from './accountsSubscriber'
+import { AccountsSubscriberAdapter, subscribeConnectionAccounts } from './accountsSubscriber'
 
 export interface GatekeeperModalProps {
   open: boolean
@@ -430,7 +430,7 @@ export default function GatekeeperModal({
         setAccounts(Array.from(accountMap.values()))
       },
     })
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    const subscription = subscribeConnectionAccounts(authenticatedApi, subscriber)
     subscription.catch(error => {
       if (cancelled) return
       logRpcFailure('Failed to subscribe to connected accounts:', error)
