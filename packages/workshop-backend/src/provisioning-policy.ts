@@ -12,6 +12,7 @@
 // calls them when provisioning, listing, and surfacing ambient accounts.
 
 import { AmbientGatekeeperMode } from "@gadgets/workshop-shared/api";
+import type { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
 import { AdminConfig } from "./admin-config.js";
 
 export const DEFAULT_AMBIENT_GATEKEEPER_MODE: AmbientGatekeeperMode = "optional";
@@ -31,4 +32,17 @@ export function ambientGatekeeperMode(config: AdminConfig, vendorId: string): Am
  */
 export function shouldAutoProvisionAccount(config: AdminConfig, vendorId: string): boolean {
   return ambientGatekeeperMode(config, vendorId) === "enabled";
+}
+
+/**
+ * Whether an existing ambient account exposes every resource type its currently-deployed vendor
+ * advertises. Stored WorkerEntrypoint capabilities can remain pinned to the Worker version that
+ * created them, so an otherwise healthy account may predate a newly-added resource type. Resource
+ * patterns are the stable type identity; titles and descriptions can change without needing a new
+ * account.
+ */
+export function accountCoversVendorResources(
+    accountResources: SupportedResource[], vendorResources: SupportedResource[]): boolean {
+  let accountPatterns = new Set(accountResources.map(resource => resource.urlPattern));
+  return vendorResources.every(resource => accountPatterns.has(resource.urlPattern));
 }

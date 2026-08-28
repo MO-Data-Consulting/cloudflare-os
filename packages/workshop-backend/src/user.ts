@@ -1,7 +1,9 @@
 import { RpcStub } from "capnweb";
 import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult, AUTH_ERROR_CODES, createAuthError } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
-import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
+import {
+  accountCoversVendorResources, shouldAutoProvisionAccount, ambientGatekeeperMode,
+} from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
@@ -1299,18 +1301,45 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async #provisionMissingAccounts(): Promise<void> {
-    // Which vendors already have an auto-provisioned account?
-    let provisioned = new Set<string>();
+    // Keep every readable ambient account. Stored WorkerEntrypoint capabilities can remain pinned
+    // to the Worker version that created them, so merely having a record does not prove it exposes
+    // resource types added by a newer vendor version.
+    let provisioned = new Map<string, ConnectedAccountRecord[]>();
     for (let rec of this.#connectedAccountRecords()) {
-      if (rec.autoProvisioned) provisioned.add(rec.vendorId);
+      if (!rec.autoProvisioned) continue;
+      let records = provisioned.get(rec.vendorId) ?? [];
+      records.push(rec);
+      provisioned.set(rec.vendorId, records);
     }
 
     let config = await readAdminConfig(this.env);
     for (let {vendorId, vendor} of await this.#ambientVendors()) {
-      if (provisioned.has(vendorId)) continue;
       // Only "enabled" (forced) vendors are auto-provisioned for everyone. "optional" vendors are
       // added on demand by the user (provisionAmbientAccount); "disabled" ones never.
       if (!shouldAutoProvisionAccount(config, vendorId)) continue;
+
+      let records = provisioned.get(vendorId) ?? [];
+      if (records.length > 0) {
+        try {
+          let vendorResources = await vendor.getSupportedResources();
+          let accountResourceSets = await Promise.all(
+              records.map(record => record.account.getSupportedResources()));
+          if (accountResourceSets.some(resources =>
+              accountCoversVendorResources(resources, vendorResources))) {
+            continue;
+          }
+          logger.info("refreshing stale auto-provisioned account capability", {
+            event: "account.auto.provision.refresh", vendorId,
+          });
+        } catch (err) {
+          // A transient resource-description failure must not mint duplicate accounts. Keep the
+          // readable account and retry the currency check on a later subscription.
+          logger.warn("failed to check auto-provisioned account capability", {
+            event: "account.auto.provision.check.failed", vendorId, error: err,
+          });
+          continue;
+        }
+      }
 
       try {
         await this.#createAutoProvisionedAccount(vendorId, vendor);
@@ -1333,12 +1362,25 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     await this.#ensureAutoProvisionedAccounts();
     let config = await readAdminConfig(this.env);
     let result: ProvidedAccountInfo[] = [];
+    let ambientResultIndexes = new Map<string, number>();
     for (let rec of this.#connectedAccountRecords()) {
       if (!rec.description.singleton && !rec.description.providesUi) continue;
       // A "disabled" ambient gatekeeper's account stays dormant: don't surface its singleton capsule
       // or management UI. (Its data is preserved, so re-enabling restores it.)
       if (rec.autoProvisioned && ambientGatekeeperMode(config, rec.vendorId) === "disabled") continue;
-      result.push({ accountId: rec.id, vendorId: rec.vendorId, description: rec.description });
+      let info = { accountId: rec.id, vendorId: rec.vendorId, description: rec.description };
+      if (rec.autoProvisioned) {
+        // A capability refresh deliberately preserves the older account and its storage. Surface
+        // only the newest account as this vendor's singleton/management app while existing gadget
+        // bindings may continue using the older account by id.
+        let previousIndex = ambientResultIndexes.get(rec.vendorId);
+        if (previousIndex !== undefined) {
+          result[previousIndex] = info;
+          continue;
+        }
+        ambientResultIndexes.set(rec.vendorId, result.length);
+      }
+      result.push(info);
     }
     return result;
   }
