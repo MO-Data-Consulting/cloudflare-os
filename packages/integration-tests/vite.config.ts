@@ -5,6 +5,10 @@ import {
   WRANGLER_RUNTIME_SCRATCH_EXCLUSIONS,
 } from '@gadgets/scripts/vitest-task'
 
+// Each integration file owns a live Workerd harness. Running those harnesses in parallel can close
+// a sibling's main RPC stub on Windows, so keep file execution serial while preserving each file's
+// explicit `it.concurrent()` coverage.
+
 export default {
   run: {
     tasks: {
@@ -34,7 +38,7 @@ export default {
        * does write: `tmp/` (per-boot bundles) and `state/` (local DO/KV storage).
        */
       test: {
-        ...vitestTaskWithExclusions('vitest run', [
+        ...vitestTaskWithExclusions('vitest run --no-file-parallelism', [
           ...VITEST_TOOL_SCRATCH_EXCLUSIONS,
           ...WRANGLER_RUNTIME_SCRATCH_EXCLUSIONS,
         ]),
