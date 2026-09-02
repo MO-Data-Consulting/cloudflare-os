@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import type { RpcStub } from 'capnweb'
+import type { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import type { AccountDescription, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
-import { AccountsSubscriberAdapter } from './accountsSubscriber'
+import { AccountsSubscriberAdapter, subscribeConnectionAccounts } from './accountsSubscriber'
 
 const DESCRIPTION = { displayName: 'acct' } as AccountDescription
 const VENDOR = { displayName: 'vendor' } as VendorDescription
@@ -19,6 +21,19 @@ function recording() {
 }
 
 describe('AccountsSubscriberAdapter', () => {
+  it('includes forced auto-provisioned accounts in connection pickers', () => {
+    const expectedSubscription = {} as unknown as ReturnType<AuthenticatedApi['subscribeConnectedAccounts']>
+    const authenticatedApi = {
+      subscribeConnectedAccounts: (...args: unknown[]) => {
+        expect(args[1]).toEqual({ includeForcedAutoProvisionedAccounts: true })
+        return expectedSubscription
+      },
+    } as unknown as RpcStub<AuthenticatedApi>
+    const subscriber = new AccountsSubscriberAdapter({ add() {}, remove() {} })
+
+    expect(subscribeConnectionAccounts(authenticatedApi, subscriber)).toBe(expectedSubscription)
+  })
+
   it('forwards adds, removes, and ready', () => {
     const { events, subscriber, add } = recording()
     add(1)

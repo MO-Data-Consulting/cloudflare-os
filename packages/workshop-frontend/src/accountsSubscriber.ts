@@ -1,5 +1,5 @@
-import { RpcTarget } from 'capnweb'
-import type { ConnectedAccountsSubscriber } from '@gadgets/workshop-shared/api'
+import { RpcTarget, type RpcStub } from 'capnweb'
+import type { AuthenticatedApi, ConnectedAccountsSubscriber } from '@gadgets/workshop-shared/api'
 import type {
   AccountDescription, SupportedResource, VendorDescription,
 } from '@gadgets/workshop-shared/gatekeeper'
@@ -18,6 +18,21 @@ export interface AccountHandlers {
   add(event: AccountEvent): void
   remove(id: number): void
   ready?(): void
+}
+
+/**
+ * Gadget connection pickers need forced ambient accounts too. The ordinary Connectors page hides
+ * those accounts because users cannot manage or disconnect them, but a gadget still needs to bind
+ * their resources. Keeping this option here prevents individual pickers from silently falling back
+ * to an OAuth flow that an auto-provisioned vendor does not have.
+ */
+export function subscribeConnectionAccounts(
+  authenticatedApi: RpcStub<AuthenticatedApi>,
+  subscriber: ConnectedAccountsSubscriber,
+) {
+  return authenticatedApi.subscribeConnectedAccounts(subscriber, {
+    includeForcedAutoProvisionedAccounts: true,
+  })
 }
 
 /**
