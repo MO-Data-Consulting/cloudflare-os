@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+/* eslint-disable react/react-in-jsx-scope */
 
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -24,8 +25,8 @@ vi.mock("../useAuth", () => ({
     authenticatedApi: null,
     isLoading: false,
     error: null,
-    logout: vi.fn(),
-    login: vi.fn(),
+    logout: vi.fn<() => void>(),
+    login: vi.fn<() => void>(),
   }),
 }));
 
