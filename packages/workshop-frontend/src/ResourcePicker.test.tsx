@@ -36,7 +36,9 @@ describe('ResourcePicker', () => {
 
   it('disposes a pending connected-account subscription on unmount', async () => {
     const pendingSubscription = deferred<{ [Symbol.dispose](): void }>()
-    const subscribeConnectedAccounts = vi.fn(() => pendingSubscription.promise)
+    const subscribeConnectedAccounts = vi.fn<
+      (...args: unknown[]) => typeof pendingSubscription.promise
+    >(() => pendingSubscription.promise)
     const authenticatedApi = {
       subscribeConnectedAccounts,
       listGatekeeperVendors: async () => [],
