@@ -1,6 +1,6 @@
 import { logRpcFailure } from '../rpcErrors'
 import { useState, useEffect } from 'react'
-import { createRootRoute, Outlet, useRouterState } from '@tanstack/react-router'
+import { createRootRoute, Outlet, useChildMatches } from '@tanstack/react-router'
 import { TooltipProvider, Toasty } from '@cloudflare/kumo'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
@@ -22,7 +22,12 @@ function RootComponent() {
   const rpcStub = useRpcStub()
   const connectionLost = useConnectionLost()
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login } = useAuth(rpcStub)
-  const pathname = useRouterState({ select: (s) => s.location.pathname })
+  // Read the route that the outlet is actually presenting. During navigation, `location` advances
+  // before the old child unmounts; using it here can expose that protected child through the public
+  // outlet after AuthProvider is gone, causing its authenticated hooks to throw.
+  const pathname = useChildMatches({
+    select: (matches) => matches.at(-1)?.pathname ?? '/',
+  })
 
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
