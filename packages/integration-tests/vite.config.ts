@@ -1,6 +1,9 @@
 import vitestTaskViteConfig, { withTestTimeout } from '../../scripts/vitest-task-vite-config.js'
 
-const config = vitestTaskViteConfig('vitest run')
+// Each integration file owns a live Workerd harness. Running those harnesses in parallel can close
+// a sibling's main RPC stub on Windows, so keep file execution serial while preserving each file's
+// explicit `it.concurrent()` coverage.
+const config = vitestTaskViteConfig('vitest run --no-file-parallelism')
 
 export default {
   run: {
