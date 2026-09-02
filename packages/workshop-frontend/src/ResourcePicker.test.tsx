@@ -36,8 +36,11 @@ describe('ResourcePicker', () => {
 
   it('disposes a pending connected-account subscription on unmount', async () => {
     const pendingSubscription = deferred<{ [Symbol.dispose](): void }>()
+    const subscribeConnectedAccounts = vi.fn<
+      (...args: unknown[]) => typeof pendingSubscription.promise
+    >(() => pendingSubscription.promise)
     const authenticatedApi = {
-      subscribeConnectedAccounts: () => pendingSubscription.promise,
+      subscribeConnectedAccounts,
       listGatekeeperVendors: async () => [],
     } as unknown as RpcStub<AuthenticatedApi>
 
@@ -55,6 +58,10 @@ describe('ResourcePicker', () => {
     act(() => root!.unmount())
     root = undefined
 
+    expect(subscribeConnectedAccounts).toHaveBeenCalledWith(
+      expect.anything(),
+      { includeForcedAutoProvisionedAccounts: true },
+    )
     expect(pendingSubscription.dispose).toHaveBeenCalledOnce()
   })
 })
