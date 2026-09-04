@@ -6,8 +6,8 @@ import type {
 } from "@gadgets/workshop-shared/api";
 import type { CodeChange } from "@gadgets/workshop-shared/code-change";
 import {
-  type ConnectedAccount, connect, listConnectedAccounts, nextUsernames, signUp, stubFor, waitFor,
-  RpcTarget,
+  type ConnectedAccount, connect, listConnectedAccounts, logIn, nextUsernames, signUp, stubFor,
+  waitFor, RpcTarget,
 } from "./rpc-client.js";
 
 const DEFAULT_TURN_TIMEOUT_MS = 40_000;
@@ -316,9 +316,11 @@ class WorkpieceSubscriber extends RpcTarget implements WorkpiecesSubscriber {
 class WorkshopAgentSessionImpl implements WorkshopAgentSession {
   readonly username: string;
   readonly #modelId: string;
+  readonly #baseUrl: URL;
   readonly #publicApi: RpcStub<PublicApi>;
   readonly #authenticatedApi: RpcStub<AuthenticatedApi>;
   readonly #workspace: RpcStub<Overseer>;
+  readonly #workspaceId: string;
   readonly #accounts: ReadonlyMap<string, ConnectedAccount>;
   readonly #chatSubscriber = new ChatSubscriber();
   readonly #turnTimeoutMs: number;
@@ -339,18 +341,22 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
   constructor(options: {
     username: string;
     modelId: string;
+    baseUrl: URL;
     publicApi: RpcStub<PublicApi>;
     authenticatedApi: RpcStub<AuthenticatedApi>;
     workspace: RpcStub<Overseer>;
+    workspaceId: string;
     accounts: ReadonlyMap<string, ConnectedAccount>;
     turnTimeoutMs: number;
     costAccountingTimeoutMs: number;
   }) {
     this.username = options.username;
     this.#modelId = options.modelId;
+    this.#baseUrl = options.baseUrl;
     this.#publicApi = options.publicApi;
     this.#authenticatedApi = options.authenticatedApi;
     this.#workspace = options.workspace;
+    this.#workspaceId = options.workspaceId;
     this.#accounts = options.accounts;
     this.#turnTimeoutMs = options.turnTimeoutMs;
     this.#costAccountingTimeoutMs = options.costAccountingTimeoutMs;
@@ -691,12 +697,25 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
       } catch (error) {
         stopError = error instanceof Error ? error : new Error(String(error));
       }
+
       try {
         await this.#beforeCancellationDeadline(
             () => this.#workspace.deleteSelf(), Date.now() + CANCELLATION_TIMEOUT_MS,
             "Workspace deletion timed out");
       } catch (error) {
-        deleteError = error instanceof Error ? error : new Error(String(error));
+        const workspaceError = error instanceof Error ? error : new Error(String(error));
+        if (workspaceError.message.includes(
+            "Peer closed WebSocket: 3000 RPC session was shut down by disposing the main stub")) {
+          try {
+            await this.#verifyWorkspaceDeleted();
+          } catch (verificationError) {
+            deleteError = new AggregateError(
+                [workspaceError, verificationError],
+                "Workspace deletion disconnected before its postcondition could be verified");
+          }
+        } else {
+          deleteError = workspaceError;
+        }
       }
     } finally {
       this.#chatSubscription?.[Symbol.dispose]();
@@ -712,6 +731,20 @@ class WorkshopAgentSessionImpl implements WorkshopAgentSession {
     }
     if (stopError !== undefined) throw stopError;
     if (deleteError !== undefined) throw deleteError;
+  }
+
+  async #verifyWorkspaceDeleted(): Promise<void> {
+    // Deleting a workspace tears down its main DO capability. On some Workerd platforms that
+    // expected teardown can win the race with deleteSelf()'s void response and close this outer
+    // WebSocket. Reconnect as the same deterministic test user and verify the durable postcondition
+    // instead of either treating a completed deletion as a failure or swallowing an unproved one.
+    using publicApi = connect(this.#baseUrl);
+    using authenticatedApi = await logIn(publicApi, this.username);
+    await waitFor("the disconnected workspace deletion to complete", async () =>
+      (await authenticatedApi.listGadgets()).some(entry => entry.id === this.#workspaceId)
+        ? null
+        : true,
+    CANCELLATION_TIMEOUT_MS);
   }
 
   #assertOpen(): void {
@@ -756,12 +789,15 @@ export async function openAgentSession(
     }
 
     workspace = await authenticated.newGadget();
+    const workspaceId = (await workspace.getMetadata()).id;
     session = new WorkshopAgentSessionImpl({
       username,
       modelId: options.modelId,
+      baseUrl,
       publicApi,
       authenticatedApi,
       workspace,
+      workspaceId,
       accounts,
       turnTimeoutMs: options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
       costAccountingTimeoutMs: options.costAccountingTimeoutMs ?? 0,
