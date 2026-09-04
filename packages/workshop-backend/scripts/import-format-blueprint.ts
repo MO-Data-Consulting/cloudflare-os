@@ -3,7 +3,7 @@
 
 import { access, readdir, readFile, rename, rm, writeFile, mkdir } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import {
@@ -63,7 +63,7 @@ function rejectIgnoredBlueprintPaths(name: string, files: Iterable<string>): voi
         `${result.error?.message ?? result.stderr.trim()}`);
   }
   const ignored = result.stdout.split("\0").filter(Boolean)
-      .map(path => relative(sourceDir, path));
+      .map(path => relative(sourceDir, path).split(sep).join("/"));
   fail(`imported blueprint paths are ignored by Git: ${ignored.join(", ")}`);
 }
 
