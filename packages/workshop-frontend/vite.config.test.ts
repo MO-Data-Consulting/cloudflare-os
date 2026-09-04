@@ -30,3 +30,15 @@ describe('Vite development proxy', () => {
     expect(resolved.build?.sourcemap).toBe('hidden')
   })
 })
+
+describe('Vite+ test task', () => {
+  it('allows cold frontend tests two minutes of idle startup time', async () => {
+    const resolved = (await resolveConfig(config)) as UserConfig & {
+      run: { tasks: { test: { command: string } } }
+    }
+
+    expect(resolved.run.tasks.test.command).toBe(
+      'gadgets-with-timeout --idle 120 --max 600 -- vitest run',
+    )
+  })
+})

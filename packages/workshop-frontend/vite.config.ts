@@ -57,7 +57,10 @@ const runConfig = {
         command: viteBuildCommand,
         ...frontendBundleTaskOptions,
       },
-      test: vitestTask('vitest run', [ownDist]),
+      // Cold Windows workers can spend more than a minute loading this suite before vitest emits
+      // its first result. Keep the shared ten-minute wall-clock backstop, but match the backend's
+      // import-heavy suite with a two-minute idle allowance so a healthy run is not killed early.
+      test: vitestTask({ command: 'vitest run', idleSeconds: 120 }, [ownDist]),
     },
   },
 }
