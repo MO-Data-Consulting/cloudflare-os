@@ -23,13 +23,20 @@
  * submodule, `..` is that fork's `public/`, which is the correct root for these assertions there.
  */
 
-import { TESTS_WITH_TIMEOUT_ENV, withTestTimeout } from "./vitest-task-vite-config.ts";
+import { TESTS_WITH_TIMEOUT_ENV, withTestTimeoutUsing } from "./vitest-task-vite-config.ts";
 
 export default {
   run: {
     tasks: {
       test: {
-        command: withTestTimeout("node --test 'scripts/**/*.test.ts'"),
+        // This task changes cwd from the scripts package to the workspace root. Naming the package
+        // bin lets Vite+ rewrite its shim relative to the package directory, which is one level off
+        // after that cwd change on Windows when multiple packages are selected. The workspace path
+        // is stable in both the public repository and a vendored fork.
+        command: withTestTimeoutUsing(
+          "node scripts/with-timeout.ts",
+          "node --test 'scripts/**/*.test.ts'",
+        ),
         env: TESTS_WITH_TIMEOUT_ENV,
         cwd: "..",
         // Workspace-wide, matching `cwd`: the suites read across `packages/` and the root manifests,

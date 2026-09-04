@@ -6,6 +6,7 @@ import {
   vitestTask,
   withTestTimeout,
 } from "./vitest-task-vite-config.ts";
+import scriptsConfig from "./vite.config.ts";
 
 // Like its siblings, this suite runs from the repo root (`cwd: '..'` in `scripts/vite.config.ts`),
 // so the configs and the watchdog are named from there.
@@ -25,7 +26,8 @@ async function watchdoggedTasksIn(config: string): Promise<[string, Task][]> {
   const { default: loaded } = await import(`../${config}`) as
     { default: { run: { tasks: Record<string, Task> } } };
   return Object.entries(loaded.run.tasks).filter(([, task]) =>
-    [task.command].flat().some(command => command.startsWith("gadgets-with-timeout")));
+    [task.command].flat().some(command =>
+      command.startsWith("gadgets-with-timeout") || command.startsWith("node scripts/with-timeout.ts")));
 }
 
 /** Runs the watchdog over a child that stays quiet for `sleepMs`, with `env` added to the child's. */
@@ -65,6 +67,13 @@ describe("withTestTimeout", () => {
     const wrapped = withTestTimeout(
       { command: "vitest run", idleSeconds: 30, maxSeconds: 5 } as never);
     assert.match(wrapped, / --max 600 -- /);
+  });
+
+  it("keeps the workspace-root task independent of package-bin path rewriting", () => {
+    assert.equal(
+      scriptsConfig.run.tasks.test.command,
+      "node scripts/with-timeout.ts --idle 60 --max 600 -- node --test 'scripts/**/*.test.ts'",
+    );
   });
 });
 

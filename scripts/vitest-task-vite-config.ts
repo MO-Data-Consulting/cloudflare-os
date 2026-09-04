@@ -154,11 +154,14 @@ const TOTAL_TIMEOUT_SECONDS = 600
  * The off switch, `TESTS_WITH_TIMEOUT_ENV`, is the one variable read, and it is declared in `env` so
  * that it is fingerprinted too.
  */
-export const withTestTimeout = (command: TestCommand): string => {
+export const withTestTimeoutUsing = (watchdog: string, command: TestCommand): string => {
   const { command: argv, idleSeconds } =
     typeof command === 'string' ? { command, idleSeconds: IDLE_TIMEOUT_SECONDS } : command
-  return `gadgets-with-timeout --idle ${idleSeconds} --max ${TOTAL_TIMEOUT_SECONDS} -- ${argv}`
+  return `${watchdog} --idle ${idleSeconds} --max ${TOTAL_TIMEOUT_SECONDS} -- ${argv}`
 }
+
+export const withTestTimeout = (command: TestCommand): string =>
+  withTestTimeoutUsing('gadgets-with-timeout', command)
 
 /**
  * The `env` every task wrapping `withTestTimeout` must declare, if it is cached.
