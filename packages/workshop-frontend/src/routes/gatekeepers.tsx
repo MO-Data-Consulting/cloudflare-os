@@ -25,6 +25,7 @@ import { GatekeeperVendorInfo } from '@gadgets/workshop-shared/api'
 import { useDocumentTitle } from '../useDocumentTitle'
 import { useSiteName } from '../ServerConfigContext'
 import { AccountsSubscriberAdapter } from '../accountsSubscriber'
+import { mergeAvailableGatekeeperVendors } from '../gatekeeper-vendor-list'
 
 export const Route = createFileRoute('/gatekeepers')({
   component: ConnectorsPage,
@@ -667,10 +668,7 @@ function ConnectorsPage() {
   // An ambient vendor is recognized by `description.autoProvisionsAccount`, which routes the connect
   // action to a direct (no-OAuth) add instead.
   const availableVendors = useMemo<VendorEntry[]>(
-    () => [
-      ...vendors,
-      ...addable,
-    ],
+    () => mergeAvailableGatekeeperVendors(vendors, addable),
     [vendors, addable],
   )
 
